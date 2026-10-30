@@ -1,0 +1,70 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "windows"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum CartStatus {
+  ACTIVE
+  CHECKED_OUT
+  FLAGGED_MISMATCH
+}
+
+enum ScanStatus {
+  SUCCESS
+  WEIGHT_MISMATCH
+  ITEM_REMOVED
+  UNKNOWN_TAG
+}
+
+model Product {
+  id              String     @id @default(cuid())
+  rfidTag         String     @unique
+  name            String
+  price           Float
+  expectedWeight  Float
+  weightTolerance Float      @default(15)
+  cartItems       CartItem[]
+}
+
+model Cart {
+  cartId                String     @id
+  status                CartStatus @default(ACTIVE)
+  totalPrice            Float      @default(0)
+  totalExpectedWeight   Float      @default(0)
+  currentMeasuredWeight Float      @default(0)
+  hasMismatch           Boolean    @default(false)
+  createdAt             DateTime   @default(now())
+  updatedAt             DateTime   @updatedAt
+  items                 CartItem[]
+  scanLogs              ScanLog[]
+}
+
+model CartItem {
+  id        String   @id @default(cuid())
+  cartId    String
+  cart      Cart     @relation(fields: [cartId], references: [cartId], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  quantity  Int
+  subtotal  Float
+  createdAt DateTime @default(now())
+
+  @@unique([cartId, productId])
+}
+
+model ScanLog {
+  id             String     @id @default(cuid())
+  cartId         String
+  cart           Cart       @relation(fields: [cartId], references: [cartId], onDelete: Cascade)
+  rfidTag        String
+  measuredWeight Float
+  status         ScanStatus
+  timestamp      DateTime   @default(now())
+
+  @@index([cartId, timestamp])
+}
