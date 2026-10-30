@@ -110,6 +110,11 @@ function isUniqueConflict(error: unknown) {
   );
 }
 
+const TX_CONFIG = {
+  maxWait: 15000,
+  timeout: 35000,
+};
+
 /** Ensure permanent trolley cart exists */
 async function getOrCreateCart(tx: Tx, cartId: string) {
   const existing = await tx.cart.findUnique({ where: { cartId } });
@@ -134,7 +139,6 @@ async function getOrCreateCart(tx: Tx, cartId: string) {
  */
 async function getOrCreateActiveSession(tx: Tx, cartId: string) {
   await getOrCreateCart(tx, cartId);
-  await tx.$queryRaw`SELECT "cartId" FROM "Cart" WHERE "cartId" = ${cartId} FOR UPDATE`;
 
   // Look for current ACTIVE session
   const activeSession = await tx.shoppingSession.findFirst({
@@ -158,7 +162,6 @@ async function getOrCreateActiveSession(tx: Tx, cartId: string) {
  */
 async function getCurrentOrNewSession(tx: Tx, cartId: string) {
   await getOrCreateCart(tx, cartId);
-  await tx.$queryRaw`SELECT "cartId" FROM "Cart" WHERE "cartId" = ${cartId} FOR UPDATE`;
 
   // First, look for an active session
   const activeSession = await tx.shoppingSession.findFirst({
@@ -291,7 +294,7 @@ function result(
 export async function getCart(cartId: string) {
   const session = await prisma.$transaction(async (tx) => {
     return getCurrentOrNewSession(tx, cartId);
-  });
+  }, TX_CONFIG);
   return toPayload(session);
 }
 
@@ -327,7 +330,6 @@ export async function scanItem(
 
     // Get current session or active session
     await getOrCreateCart(tx, cartId);
-    await tx.$queryRaw`SELECT "cartId" FROM "Cart" WHERE "cartId" = ${cartId} FOR UPDATE`;
 
     const latestSession = await tx.shoppingSession.findFirst({
       where: { cartId },
@@ -462,7 +464,7 @@ export async function scanItem(
       },
       updated,
     );
-  });
+  }, TX_CONFIG);
 }
 
 export async function removeLastItem(
@@ -541,7 +543,7 @@ export async function removeLastItem(
       },
       updated,
     );
-  });
+  }, TX_CONFIG);
 }
 
 export async function removeCartItem(
@@ -601,7 +603,7 @@ export async function removeCartItem(
       },
       updated,
     );
-  });
+  }, TX_CONFIG);
 }
 
 export async function checkoutCart(
@@ -694,7 +696,7 @@ export async function checkoutCart(
       },
       updated,
     );
-  });
+  }, TX_CONFIG);
 }
 
 /**
@@ -704,7 +706,6 @@ export async function checkoutCart(
 export async function resetCart(cartId: string) {
   return prisma.$transaction(async (tx) => {
     await getOrCreateCart(tx, cartId);
-    await tx.$queryRaw`SELECT "cartId" FROM "Cart" WHERE "cartId" = ${cartId} FOR UPDATE`;
 
     // Mark any existing active sessions as ABANDONED (or COMPLETED if already checked out)
     const existingActive = await tx.shoppingSession.findMany({
@@ -731,7 +732,7 @@ export async function resetCart(cartId: string) {
     });
 
     return result(200, { status: "RESET", cartId }, newSession);
-  });
+  }, TX_CONFIG);
 }
 
 export async function getOverview(): Promise<OverviewPayload> {
