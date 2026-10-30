@@ -12,6 +12,15 @@ const nextConfig: NextConfig = {
       },
     },
   },
+  async redirects() {
+    return [
+      {
+        source: "/cart/:cartId",
+        destination: "/:cartId",
+        permanent: true,
+      },
+    ];
+  },
 };
 
 export default nextConfig;

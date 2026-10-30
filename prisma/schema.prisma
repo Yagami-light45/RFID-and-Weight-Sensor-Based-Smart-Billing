@@ -8,63 +8,125 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum CartStatus {
+enum CartOperationalStatus {
   ACTIVE
-  CHECKED_OUT
-  FLAGGED_MISMATCH
+  MAINTENANCE
+  INACTIVE
 }
 
-enum ScanStatus {
+enum SessionStatus {
+  ACTIVE
+  COMPLETED
+  ABANDONED
+}
+
+enum ScanAction {
+  ADD
+  REMOVE
+}
+
+enum ScanResult {
   SUCCESS
-  WEIGHT_MISMATCH
-  ITEM_REMOVED
+  MISMATCH
   UNKNOWN_TAG
+  DUPLICATE
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+}
+
+model Cart {
+  cartId            String                @id
+  cartCode          String                @unique @default(cuid())
+  qrCodeUrl         String?
+  operationalStatus CartOperationalStatus @default(ACTIVE)
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  sessions          ShoppingSession[]
 }
 
 model Product {
   id              String     @id @default(cuid())
-  rfidTag         String     @unique
+  rfidUid         String     @unique
   name            String
-  price           Float
+  price           Decimal    @db.Decimal(10, 2)
   expectedWeight  Float
   weightTolerance Float      @default(15)
+  isAvailable     Boolean    @default(true)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
   cartItems       CartItem[]
 }
 
-model Cart {
-  cartId                String     @id
-  status                CartStatus @default(ACTIVE)
-  totalPrice            Float      @default(0)
-  totalExpectedWeight   Float      @default(0)
-  currentMeasuredWeight Float      @default(0)
-  hasMismatch           Boolean    @default(false)
-  createdAt             DateTime   @default(now())
-  updatedAt             DateTime   @updatedAt
+model ShoppingSession {
+  id                    String        @id @default(cuid())
+  cartId                String
+  cart                  Cart          @relation(fields: [cartId], references: [cartId], onDelete: Cascade)
+  status                SessionStatus @default(ACTIVE)
+  startedAt             DateTime      @default(now())
+  completedAt           DateTime?
+  totalPrice            Decimal       @default(0) @db.Decimal(10, 2)
+  totalExpectedWeight   Float         @default(0)
+  currentMeasuredWeight Float         @default(0)
+  hasMismatch           Boolean       @default(false)
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
   items                 CartItem[]
-  scanLogs              ScanLog[]
+  scanEvents            ScanEvent[]
+  transaction           Transaction?
+
+  @@index([cartId, status])
 }
 
 model CartItem {
-  id        String   @id @default(cuid())
-  cartId    String
-  cart      Cart     @relation(fields: [cartId], references: [cartId], onDelete: Cascade)
-  productId String
-  product   Product  @relation(fields: [productId], references: [id])
-  quantity  Int
-  subtotal  Float
-  createdAt DateTime @default(now())
+  id                     String          @id @default(cuid())
+  sessionId              String
+  session                ShoppingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  productId              String
+  product                Product         @relation(fields: [productId], references: [id])
+  quantity               Int
+  productNameSnapshot    String
+  unitPriceSnapshot      Decimal         @db.Decimal(10, 2)
+  subtotal               Decimal         @db.Decimal(10, 2)
+  expectedWeightSnapshot Float
+  createdAt              DateTime        @default(now())
+  updatedAt              DateTime        @updatedAt
 
-  @@unique([cartId, productId])
+  @@unique([sessionId, productId])
+  @@index([sessionId])
 }
 
-model ScanLog {
-  id             String     @id @default(cuid())
-  cartId         String
-  cart           Cart       @relation(fields: [cartId], references: [cartId], onDelete: Cascade)
-  rfidTag        String
+model ScanEvent {
+  id             String          @id @default(cuid())
+  eventId        String          @unique
+  sessionId      String
+  session        ShoppingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  rfidUid        String
+  action         ScanAction      @default(ADD)
   measuredWeight Float
-  status         ScanStatus
-  timestamp      DateTime   @default(now())
+  scanResult     ScanResult
+  timestamp      DateTime        @default(now())
 
-  @@index([cartId, timestamp])
+  @@index([sessionId, timestamp])
+  @@index([eventId])
+}
+
+model Transaction {
+  id            String          @id @default(cuid())
+  sessionId     String          @unique
+  session       ShoppingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  subtotal      Decimal         @db.Decimal(10, 2)
+  tax           Decimal         @default(0) @db.Decimal(10, 2)
+  discount      Decimal         @default(0) @db.Decimal(10, 2)
+  finalTotal    Decimal         @db.Decimal(10, 2)
+  paymentMethod String
+  paymentStatus PaymentStatus   @default(PAID)
+  reference     String          @unique
+  timestamp     DateTime        @default(now())
 }

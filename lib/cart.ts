@@ -1,19 +1,29 @@
-import { Prisma, type ScanStatus } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { HttpError } from "@/lib/http";
 import { ADMIN_CHANNEL, cartChannel, publish } from "@/lib/realtime";
-import type { CartPayload, OverviewPayload, PaymentMethod } from "@/lib/types";
+import type {
+  CartPayload,
+  OverviewPayload,
+  PaymentMethod,
+  ScanAction,
+} from "@/lib/types";
 
 const DEFAULT_TOLERANCE = 15;
 
-const cartInclude = {
+const sessionInclude = {
+  cart: true,
   items: {
     include: { product: true },
     orderBy: { createdAt: "asc" as const },
   },
-} satisfies Prisma.CartInclude;
+  transaction: true,
+} satisfies Prisma.ShoppingSessionInclude;
 
-type CartRecord = Prisma.CartGetPayload<{ include: typeof cartInclude }>;
+type SessionRecord = Prisma.ShoppingSessionGetPayload<{
+  include: typeof sessionInclude;
+}>;
+
 type Tx = Prisma.TransactionClient;
 
 export type ActionResult = {
@@ -39,30 +49,57 @@ export function exceedsTolerance(
   return Math.abs(measured - expected) - tolerance > 1e-6;
 }
 
-export function toPayload(cart: CartRecord): CartPayload {
-  const items = cart.items.map((item) => ({
+export function toPayload(session: SessionRecord): CartPayload {
+  const items = session.items.map((item) => ({
     id: item.id,
     productId: item.productId,
-    rfidTag: item.product.rfidTag,
-    name: item.product.name,
-    unitPrice: item.product.price,
-    expectedWeight: item.product.expectedWeight,
+    rfidUid: item.product.rfidUid,
+    rfidTag: item.product.rfidUid,
+    name: item.productNameSnapshot,
+    unitPrice: Number(item.unitPriceSnapshot),
+    expectedWeight: item.expectedWeightSnapshot,
     weightTolerance: item.product.weightTolerance,
     quantity: item.quantity,
-    subtotal: item.subtotal,
-    lineWeight: roundGrams(item.product.expectedWeight * item.quantity),
+    subtotal: Number(item.subtotal),
+    lineWeight: roundGrams(item.expectedWeightSnapshot * item.quantity),
   }));
 
+  const isCheckedOut = session.status === "COMPLETED";
+  const status: CartPayload["status"] = isCheckedOut
+    ? "CHECKED_OUT"
+    : session.hasMismatch
+      ? "FLAGGED_MISMATCH"
+      : "ACTIVE";
+
   return {
-    cartId: cart.cartId,
-    status: cart.status,
-    totalPrice: cart.totalPrice,
-    totalExpectedWeight: cart.totalExpectedWeight,
-    currentMeasuredWeight: cart.currentMeasuredWeight,
-    hasMismatch: cart.hasMismatch,
-    updatedAt: cart.updatedAt.toISOString(),
+    cartId: session.cartId,
+    cartCode: session.cart.cartCode,
+    operationalStatus: session.cart.operationalStatus,
+    sessionId: session.id,
+    sessionStatus: session.status,
+    startedAt: session.startedAt.toISOString(),
+    completedAt: session.completedAt ? session.completedAt.toISOString() : null,
+    status,
+    totalPrice: Number(session.totalPrice),
+    totalExpectedWeight: session.totalExpectedWeight,
+    currentMeasuredWeight: session.currentMeasuredWeight,
+    hasMismatch: session.hasMismatch,
+    updatedAt: session.updatedAt.toISOString(),
     itemCount: items.reduce((sum, item) => sum + item.quantity, 0),
     items,
+    transaction: session.transaction
+      ? {
+          id: session.transaction.id,
+          reference: session.transaction.reference,
+          paymentMethod: session.transaction.paymentMethod,
+          paymentStatus: session.transaction.paymentStatus,
+          subtotal: Number(session.transaction.subtotal),
+          tax: Number(session.transaction.tax),
+          discount: Number(session.transaction.discount),
+          finalTotal: Number(session.transaction.finalTotal),
+          timestamp: session.transaction.timestamp.toISOString(),
+        }
+      : null,
   };
 }
 
@@ -73,11 +110,17 @@ function isUniqueConflict(error: unknown) {
   );
 }
 
+/** Ensure permanent trolley cart exists */
 async function getOrCreateCart(tx: Tx, cartId: string) {
   const existing = await tx.cart.findUnique({ where: { cartId } });
   if (existing) return existing;
   try {
-    return await tx.cart.create({ data: { cartId } });
+    return await tx.cart.create({
+      data: {
+        cartId,
+        cartCode: cartId,
+      },
+    });
   } catch (error) {
     if (isUniqueConflict(error)) {
       return tx.cart.findUniqueOrThrow({ where: { cartId } });
@@ -86,78 +129,138 @@ async function getOrCreateCart(tx: Tx, cartId: string) {
   }
 }
 
-async function lockCart(tx: Tx, cartId: string) {
+/**
+ * Enforce at most one ACTIVE shopping session per trolley through transactional logic.
+ */
+async function getOrCreateActiveSession(tx: Tx, cartId: string) {
+  await getOrCreateCart(tx, cartId);
   await tx.$queryRaw`SELECT "cartId" FROM "Cart" WHERE "cartId" = ${cartId} FOR UPDATE`;
-  return tx.cart.findUniqueOrThrow({
-    where: { cartId },
-    include: cartInclude,
+
+  // Look for current ACTIVE session
+  const activeSession = await tx.shoppingSession.findFirst({
+    where: { cartId, status: "ACTIVE" },
+    include: sessionInclude,
+  });
+  if (activeSession) return activeSession;
+
+  // Otherwise, create a new ACTIVE session
+  return tx.shoppingSession.create({
+    data: {
+      cartId,
+      status: "ACTIVE",
+    },
+    include: sessionInclude,
   });
 }
 
-function assertOpen(cart: { status: string }) {
-  if (cart.status === "CHECKED_OUT") {
+/**
+ * Get current session for cart (active session if open, or the latest completed session).
+ */
+async function getCurrentOrNewSession(tx: Tx, cartId: string) {
+  await getOrCreateCart(tx, cartId);
+  await tx.$queryRaw`SELECT "cartId" FROM "Cart" WHERE "cartId" = ${cartId} FOR UPDATE`;
+
+  // First, look for an active session
+  const activeSession = await tx.shoppingSession.findFirst({
+    where: { cartId, status: "ACTIVE" },
+    include: sessionInclude,
+  });
+  if (activeSession) return activeSession;
+
+  // Next, look for the most recent session (e.g. recently checked out)
+  const latestSession = await tx.shoppingSession.findFirst({
+    where: { cartId },
+    orderBy: { createdAt: "desc" },
+    include: sessionInclude,
+  });
+  if (latestSession) return latestSession;
+
+  // If none exists, create a new active session
+  return tx.shoppingSession.create({
+    data: {
+      cartId,
+      status: "ACTIVE",
+    },
+    include: sessionInclude,
+  });
+}
+
+function assertOpenSession(session: { status: string }) {
+  if (session.status === "COMPLETED") {
     throw new HttpError(409, "Cart is already checked out");
+  }
+  if (session.status === "ABANDONED") {
+    throw new HttpError(409, "Shopping session is no longer active");
   }
 }
 
-async function writeOpenCart(
+async function recalculateSessionTotals(
   tx: Tx,
-  cartId: string,
+  sessionId: string,
   measuredWeight: number,
   mismatch: boolean,
 ) {
   const items = await tx.cartItem.findMany({
-    where: { cartId },
+    where: { sessionId },
     include: { product: true },
   });
-  const totalPrice = roundMoney(
-    items.reduce((sum, item) => sum + item.quantity * item.product.price, 0),
+
+  const totalPrice = items.reduce(
+    (sum, item) => sum + Number(item.subtotal),
+    0,
   );
   const totalExpectedWeight = roundGrams(
     items.reduce(
-      (sum, item) => sum + item.quantity * item.product.expectedWeight,
+      (sum, item) => sum + item.quantity * item.expectedWeightSnapshot,
       0,
     ),
   );
 
-  return tx.cart.update({
-    where: { cartId },
+  return tx.shoppingSession.update({
+    where: { id: sessionId },
     data: {
-      totalPrice,
+      totalPrice: new Prisma.Decimal(roundMoney(totalPrice)),
       totalExpectedWeight,
       currentMeasuredWeight: roundGrams(measuredWeight),
       hasMismatch: mismatch,
-      status: mismatch ? "FLAGGED_MISMATCH" : "ACTIVE",
     },
-    include: cartInclude,
+    include: sessionInclude,
   });
 }
 
-async function logScan(
+async function recordScanEvent(
   tx: Tx,
-  cartId: string,
-  rfidTag: string,
+  sessionId: string,
+  rfidUid: string,
+  action: ScanAction,
   measuredWeight: number,
-  status: ScanStatus,
+  scanResult: "SUCCESS" | "MISMATCH" | "UNKNOWN_TAG" | "DUPLICATE",
+  eventId?: string,
 ) {
-  await tx.scanLog.create({
+  const effectiveEventId =
+    eventId ||
+    `evt_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+
+  return tx.scanEvent.create({
     data: {
-      cartId,
-      rfidTag,
+      eventId: effectiveEventId,
+      sessionId,
+      rfidUid,
+      action,
       measuredWeight: roundGrams(measuredWeight),
-      status,
+      scanResult,
     },
   });
 }
 
-async function decrementItem(
+async function decrementSessionItem(
   tx: Tx,
-  cartId: string,
+  sessionId: string,
   productId: string,
-  price: number,
+  unitPrice: number,
 ) {
   const item = await tx.cartItem.findUnique({
-    where: { cartId_productId: { cartId, productId } },
+    where: { sessionId_productId: { sessionId, productId } },
   });
   if (!item || item.quantity < 1) {
     throw new HttpError(400, "Item is not in the cart");
@@ -167,47 +270,110 @@ async function decrementItem(
     return;
   }
   const quantity = item.quantity - 1;
+  const subtotal = roundMoney(quantity * unitPrice);
   await tx.cartItem.update({
     where: { id: item.id },
-    data: { quantity, subtotal: roundMoney(quantity * price) },
+    data: {
+      quantity,
+      subtotal: new Prisma.Decimal(subtotal),
+    },
   });
 }
 
 function result(
   status: number,
   body: Record<string, unknown>,
-  cart: CartRecord,
+  session: SessionRecord,
 ): ActionResult {
-  return { status, body, cart: toPayload(cart) };
+  return { status, body, cart: toPayload(session) };
 }
 
 export async function getCart(cartId: string) {
-  const cart = await prisma.$transaction(async (tx) => {
-    await getOrCreateCart(tx, cartId);
-    return lockCart(tx, cartId);
+  const session = await prisma.$transaction(async (tx) => {
+    return getCurrentOrNewSession(tx, cartId);
   });
-  return toPayload(cart);
+  return toPayload(session);
 }
 
 export async function scanItem(
   cartId: string,
-  rfidTag: string,
+  rfidUid: string,
   measuredWeight: number,
+  eventId?: string,
 ) {
   return prisma.$transaction(async (tx) => {
-    await getOrCreateCart(tx, cartId);
-    const cart = await lockCart(tx, cartId);
-    assertOpen(cart);
+    // Check idempotency if eventId is provided
+    if (eventId) {
+      const existingEvent = await tx.scanEvent.findUnique({
+        where: { eventId },
+      });
+      if (existingEvent) {
+        const session = await tx.shoppingSession.findUniqueOrThrow({
+          where: { id: existingEvent.sessionId },
+          include: sessionInclude,
+        });
+        return result(
+          200,
+          {
+            status: "DUPLICATE",
+            eventId,
+            message: "Event already processed",
+            total: Number(session.totalPrice),
+          },
+          session,
+        );
+      }
+    }
 
-    const product = await tx.product.findUnique({ where: { rfidTag } });
-    if (!product) {
+    // Get current session or active session
+    await getOrCreateCart(tx, cartId);
+    await tx.$queryRaw`SELECT "cartId" FROM "Cart" WHERE "cartId" = ${cartId} FOR UPDATE`;
+
+    const latestSession = await tx.shoppingSession.findFirst({
+      where: { cartId },
+      orderBy: { createdAt: "desc" },
+      include: sessionInclude,
+    });
+
+    if (latestSession && latestSession.status === "COMPLETED") {
+      throw new HttpError(409, "Cart is already checked out");
+    }
+
+    const session =
+      latestSession ??
+      (await tx.shoppingSession.create({
+        data: {
+          cartId,
+          status: "ACTIVE",
+        },
+        include: sessionInclude,
+      }));
+
+    assertOpenSession(session);
+
+    // Look up product by rfidUid
+    const product = await tx.product.findUnique({ where: { rfidUid } });
+    if (!product || !product.isAvailable) {
       const mismatch = exceedsTolerance(
         measuredWeight,
-        cart.totalExpectedWeight,
+        session.totalExpectedWeight,
         DEFAULT_TOLERANCE,
       );
-      await logScan(tx, cartId, rfidTag, measuredWeight, "UNKNOWN_TAG");
-      const updated = await writeOpenCart(tx, cartId, measuredWeight, mismatch);
+      await recordScanEvent(
+        tx,
+        session.id,
+        rfidUid,
+        "ADD",
+        measuredWeight,
+        "UNKNOWN_TAG",
+        eventId,
+      );
+      const updated = await recalculateSessionTotals(
+        tx,
+        session.id,
+        measuredWeight,
+        mismatch,
+      );
       return result(
         404,
         {
@@ -220,87 +386,158 @@ export async function scanItem(
     }
 
     const nextExpected = roundGrams(
-      cart.totalExpectedWeight + product.expectedWeight,
+      session.totalExpectedWeight + product.expectedWeight,
     );
     if (exceedsTolerance(measuredWeight, nextExpected, product.weightTolerance)) {
-      await logScan(tx, cartId, rfidTag, measuredWeight, "WEIGHT_MISMATCH");
-      const updated = await writeOpenCart(tx, cartId, measuredWeight, true);
+      await recordScanEvent(
+        tx,
+        session.id,
+        rfidUid,
+        "ADD",
+        measuredWeight,
+        "MISMATCH",
+        eventId,
+      );
+      const updated = await recalculateSessionTotals(
+        tx,
+        session.id,
+        measuredWeight,
+        true,
+      );
       return result(200, { status: "MISMATCH", alertBuzzer: true }, updated);
     }
 
-    const existing = cart.items.find((item) => item.productId === product.id);
-    if (existing) {
-      const quantity = existing.quantity + 1;
+    // Within weight tolerance -> SUCCESS
+    const existingItem = session.items.find(
+      (item) => item.productId === product.id,
+    );
+    const unitPrice = Number(product.price);
+
+    if (existingItem) {
+      const quantity = existingItem.quantity + 1;
+      const subtotal = roundMoney(quantity * unitPrice);
       await tx.cartItem.update({
-        where: { id: existing.id },
-        data: { quantity, subtotal: roundMoney(quantity * product.price) },
+        where: { id: existingItem.id },
+        data: {
+          quantity,
+          subtotal: new Prisma.Decimal(subtotal),
+        },
       });
     } else {
       await tx.cartItem.create({
         data: {
-          cartId,
+          sessionId: session.id,
           productId: product.id,
           quantity: 1,
-          subtotal: roundMoney(product.price),
+          productNameSnapshot: product.name,
+          unitPriceSnapshot: product.price,
+          subtotal: product.price,
+          expectedWeightSnapshot: product.expectedWeight,
         },
       });
     }
 
-    await logScan(tx, cartId, rfidTag, measuredWeight, "SUCCESS");
-    const updated = await writeOpenCart(tx, cartId, measuredWeight, false);
+    await recordScanEvent(
+      tx,
+      session.id,
+      rfidUid,
+      "ADD",
+      measuredWeight,
+      "SUCCESS",
+      eventId,
+    );
+    const updated = await recalculateSessionTotals(
+      tx,
+      session.id,
+      measuredWeight,
+      false,
+    );
+
     return result(
       200,
-      { status: "SUCCESS", product: product.name, total: updated.totalPrice },
+      {
+        status: "SUCCESS",
+        product: product.name,
+        total: Number(updated.totalPrice),
+      },
       updated,
     );
   });
 }
 
-export async function removeLastItem(cartId: string, measuredWeight: number) {
+export async function removeLastItem(
+  cartId: string,
+  measuredWeight: number,
+  eventId?: string,
+) {
   return prisma.$transaction(async (tx) => {
-    const existing = await tx.cart.findUnique({ where: { cartId } });
-    if (!existing) throw new HttpError(404, "Cart not found");
+    const session = await getOrCreateActiveSession(tx, cartId);
+    assertOpenSession(session);
 
-    const cart = await lockCart(tx, cartId);
-    assertOpen(cart);
-
-    const logs = await tx.scanLog.findMany({
-      where: { cartId, status: "SUCCESS" },
+    // Find the latest successful ADD scan event in this session
+    const logs = await tx.scanEvent.findMany({
+      where: { sessionId: session.id, scanResult: "SUCCESS", action: "ADD" },
       orderBy: { timestamp: "desc" },
     });
 
-    let product: CartRecord["items"][number]["product"] | null = null;
+    let targetItem: SessionRecord["items"][number] | null = null;
     for (const log of logs) {
-      const found = await tx.product.findUnique({ where: { rfidTag: log.rfidTag } });
-      if (!found) continue;
-      const item = cart.items.find((entry) => entry.productId === found.id);
+      const product = await tx.product.findUnique({
+        where: { rfidUid: log.rfidUid },
+      });
+      if (!product) continue;
+      const item = session.items.find((entry) => entry.productId === product.id);
       if (item && item.quantity > 0) {
-        product = found;
+        targetItem = item;
         break;
       }
     }
-    if (!product) throw new HttpError(400, "No scanned item to remove");
 
-    await decrementItem(tx, cartId, product.id, product.price);
+    if (!targetItem) {
+      throw new HttpError(400, "No scanned item to remove");
+    }
+
+    await decrementSessionItem(
+      tx,
+      session.id,
+      targetItem.productId,
+      Number(targetItem.unitPriceSnapshot),
+    );
+
     const nextExpected = Math.max(
       0,
-      roundGrams(cart.totalExpectedWeight - product.expectedWeight),
+      roundGrams(session.totalExpectedWeight - targetItem.expectedWeightSnapshot),
     );
     const mismatch = exceedsTolerance(
       measuredWeight,
       nextExpected,
-      product.weightTolerance,
+      targetItem.product.weightTolerance,
     );
-    await logScan(tx, cartId, product.rfidTag, measuredWeight, "ITEM_REMOVED");
-    const updated = await writeOpenCart(tx, cartId, measuredWeight, mismatch);
+
+    await recordScanEvent(
+      tx,
+      session.id,
+      targetItem.product.rfidUid,
+      "REMOVE",
+      measuredWeight,
+      mismatch ? "MISMATCH" : "SUCCESS",
+      eventId,
+    );
+
+    const updated = await recalculateSessionTotals(
+      tx,
+      session.id,
+      measuredWeight,
+      mismatch,
+    );
 
     return result(
       200,
       {
         status: mismatch ? "MISMATCH" : "SUCCESS",
         alertBuzzer: mismatch,
-        product: product.name,
-        total: updated.totalPrice,
+        product: targetItem.productNameSnapshot,
+        total: Number(updated.totalPrice),
       },
       updated,
     );
@@ -311,42 +548,56 @@ export async function removeCartItem(
   cartId: string,
   itemId: string,
   measuredWeight: number,
+  eventId?: string,
 ) {
   return prisma.$transaction(async (tx) => {
-    const existing = await tx.cart.findUnique({ where: { cartId } });
-    if (!existing) throw new HttpError(404, "Cart not found");
+    const session = await getOrCreateActiveSession(tx, cartId);
+    assertOpenSession(session);
 
-    const cart = await lockCart(tx, cartId);
-    assertOpen(cart);
-    const item = cart.items.find((entry) => entry.id === itemId);
+    const item = session.items.find((entry) => entry.id === itemId);
     if (!item) throw new HttpError(404, "Item is not in the cart");
 
-    await decrementItem(tx, cartId, item.productId, item.product.price);
+    await decrementSessionItem(
+      tx,
+      session.id,
+      item.productId,
+      Number(item.unitPriceSnapshot),
+    );
+
     const nextExpected = Math.max(
       0,
-      roundGrams(cart.totalExpectedWeight - item.product.expectedWeight),
+      roundGrams(session.totalExpectedWeight - item.expectedWeightSnapshot),
     );
     const mismatch = exceedsTolerance(
       measuredWeight,
       nextExpected,
       item.product.weightTolerance,
     );
-    await logScan(
+
+    await recordScanEvent(
       tx,
-      cartId,
-      item.product.rfidTag,
+      session.id,
+      item.product.rfidUid,
+      "REMOVE",
       measuredWeight,
-      "ITEM_REMOVED",
+      mismatch ? "MISMATCH" : "SUCCESS",
+      eventId,
     );
-    const updated = await writeOpenCart(tx, cartId, measuredWeight, mismatch);
+
+    const updated = await recalculateSessionTotals(
+      tx,
+      session.id,
+      measuredWeight,
+      mismatch,
+    );
 
     return result(
       200,
       {
         status: mismatch ? "MISMATCH" : "SUCCESS",
         alertBuzzer: mismatch,
-        product: item.product.name,
-        total: updated.totalPrice,
+        product: item.productNameSnapshot,
+        total: Number(updated.totalPrice),
       },
       updated,
     );
@@ -359,18 +610,23 @@ export async function checkoutCart(
   paymentMethod?: PaymentMethod,
 ) {
   return prisma.$transaction(async (tx) => {
-    const existing = await tx.cart.findUnique({ where: { cartId } });
-    if (!existing) throw new HttpError(404, "Cart not found");
-
-    const cart = await lockCart(tx, cartId);
-    assertOpen(cart);
-    if (cart.items.length === 0) throw new HttpError(400, "Cart is empty");
+    const session = await getOrCreateActiveSession(tx, cartId);
+    assertOpenSession(session);
+    if (session.items.length === 0) throw new HttpError(400, "Cart is empty");
 
     const tolerance = Math.max(
-      ...cart.items.map((item) => item.product.weightTolerance),
+      ...session.items.map((item) => item.product.weightTolerance),
     );
-    if (exceedsTolerance(measuredWeight, cart.totalExpectedWeight, tolerance)) {
-      const updated = await writeOpenCart(tx, cartId, measuredWeight, true);
+
+    if (
+      exceedsTolerance(measuredWeight, session.totalExpectedWeight, tolerance)
+    ) {
+      const updated = await recalculateSessionTotals(
+        tx,
+        session.id,
+        measuredWeight,
+        true,
+      );
       return result(
         200,
         {
@@ -383,28 +639,49 @@ export async function checkoutCart(
     }
 
     if (!paymentMethod) {
-      const updated = await writeOpenCart(tx, cartId, measuredWeight, false);
+      const updated = await recalculateSessionTotals(
+        tx,
+        session.id,
+        measuredWeight,
+        false,
+      );
       return result(
         200,
         {
           status: "VERIFIED",
-          total: updated.totalPrice,
+          total: Number(updated.totalPrice),
           message: "Weight verified. Choose a payment method.",
         },
         updated,
       );
     }
 
-    const updated = await tx.cart.update({
-      where: { cartId },
+    // Complete session and record Transaction
+    const reference = `PAY-${cartId}-${Date.now().toString(36).toUpperCase()}`;
+
+    await tx.transaction.create({
       data: {
+        sessionId: session.id,
+        subtotal: session.totalPrice,
+        tax: new Prisma.Decimal(0),
+        discount: new Prisma.Decimal(0),
+        finalTotal: session.totalPrice,
+        paymentMethod,
+        paymentStatus: "PAID",
+        reference,
+      },
+    });
+
+    const updated = await tx.shoppingSession.update({
+      where: { id: session.id },
+      data: {
+        status: "COMPLETED",
+        completedAt: new Date(),
         currentMeasuredWeight: roundGrams(measuredWeight),
         hasMismatch: false,
-        status: "CHECKED_OUT",
       },
-      include: cartInclude,
+      include: sessionInclude,
     });
-    const reference = `PAY-${cartId}-${Date.now().toString(36).toUpperCase()}`;
 
     return result(
       200,
@@ -412,7 +689,7 @@ export async function checkoutCart(
         status: "CHECKED_OUT",
         paymentMethod,
         reference,
-        total: updated.totalPrice,
+        total: Number(updated.totalPrice),
         message: "Payment successful",
       },
       updated,
@@ -420,45 +697,95 @@ export async function checkoutCart(
   });
 }
 
+/**
+ * Start a fresh shopping session for a subsequent customer.
+ * Previous completed sessions, items, events, and transactions are NEVER deleted.
+ */
 export async function resetCart(cartId: string) {
   return prisma.$transaction(async (tx) => {
-    const existing = await tx.cart.findUnique({ where: { cartId } });
-    if (!existing) throw new HttpError(404, "Cart not found");
-    await lockCart(tx, cartId);
-    await tx.cartItem.deleteMany({ where: { cartId } });
-    const updated = await tx.cart.update({
-      where: { cartId },
-      data: {
-        status: "ACTIVE",
-        totalPrice: 0,
-        totalExpectedWeight: 0,
-        currentMeasuredWeight: 0,
-        hasMismatch: false,
-      },
-      include: cartInclude,
+    await getOrCreateCart(tx, cartId);
+    await tx.$queryRaw`SELECT "cartId" FROM "Cart" WHERE "cartId" = ${cartId} FOR UPDATE`;
+
+    // Mark any existing active sessions as ABANDONED (or COMPLETED if already checked out)
+    const existingActive = await tx.shoppingSession.findMany({
+      where: { cartId, status: "ACTIVE" },
     });
-    return result(200, { status: "RESET", cartId }, updated);
+
+    for (const active of existingActive) {
+      await tx.shoppingSession.update({
+        where: { id: active.id },
+        data: {
+          status: "ABANDONED",
+          completedAt: new Date(),
+        },
+      });
+    }
+
+    // Create a new, fresh ACTIVE session for this trolley
+    const newSession = await tx.shoppingSession.create({
+      data: {
+        cartId,
+        status: "ACTIVE",
+      },
+      include: sessionInclude,
+    });
+
+    return result(200, { status: "RESET", cartId }, newSession);
   });
 }
 
 export async function getOverview(): Promise<OverviewPayload> {
   const carts = await prisma.cart.findMany({
-    include: cartInclude,
     orderBy: { cartId: "asc" },
   });
-  const payloads = carts.map(toPayload);
+
+  const cartPayloads: CartPayload[] = [];
+  for (const cart of carts) {
+    const session = await prisma.shoppingSession.findFirst({
+      where: { cartId: cart.cartId },
+      orderBy: { createdAt: "desc" },
+      include: sessionInclude,
+    });
+    if (session) {
+      cartPayloads.push(toPayload(session));
+    } else {
+      cartPayloads.push({
+        cartId: cart.cartId,
+        cartCode: cart.cartCode,
+        operationalStatus: cart.operationalStatus,
+        status: "ACTIVE",
+        totalPrice: 0,
+        totalExpectedWeight: 0,
+        currentMeasuredWeight: 0,
+        hasMismatch: false,
+        updatedAt: cart.updatedAt.toISOString(),
+        itemCount: 0,
+        items: [],
+      });
+    }
+  }
+
+  // Calculate total revenue from all completed transactions
+  const transactions = await prisma.transaction.findMany({
+    where: { paymentStatus: "PAID" },
+  });
+  const totalRevenue = roundMoney(
+    transactions.reduce((sum, tx) => sum + Number(tx.finalTotal), 0),
+  );
+
+  const activeSessionsCount = await prisma.shoppingSession.count({
+    where: { status: "ACTIVE" },
+  });
+
+  const flaggedCartsCount = cartPayloads.filter(
+    (c) => c.hasMismatch || c.status === "FLAGGED_MISMATCH",
+  ).length;
+
   return {
-    totalRevenue: roundMoney(
-      payloads
-        .filter((cart) => cart.status === "CHECKED_OUT")
-        .reduce((sum, cart) => sum + cart.totalPrice, 0),
-    ),
-    activeSessions: payloads.filter((cart) => cart.status !== "CHECKED_OUT")
-      .length,
-    flaggedCarts: payloads.filter(
-      (cart) => cart.hasMismatch || cart.status === "FLAGGED_MISMATCH",
-    ).length,
-    carts: payloads,
+    totalRevenue,
+    activeSessions: activeSessionsCount,
+    flaggedCarts: flaggedCartsCount,
+    carts: cartPayloads,
   };
 }
 

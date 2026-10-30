@@ -34,7 +34,7 @@ async function StoreHome() {
   const cartIds = carts.length > 0 ? carts.map((cart) => cart.cartId) : ["CART_01", "CART_02", "CART_03"];
   const cards = await Promise.all(
     cartIds.map(async (cartId) => {
-      const href = `${base}/cart/${cartId}`;
+      const href = `${base}/${cartId}`;
       const qr = await QRCode.toDataURL(href, { margin: 1, width: 168 });
       return { cartId, href, qr };
     }),
@@ -46,8 +46,8 @@ async function StoreHome() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Smart billing trolleys</h1>
           <p className="mt-1 max-w-xl text-sm leading-6 text-stone-600">
-            Each trolley has a cart page. The ESP32 posts RFID scans and the load-cell
-            weight. The bill updates live, and a weight mismatch flags the cart.
+            Each trolley has a dedicated customer page. The ESP32 posts RFID scans and the load-cell
+            weight. The bill updates live with session-based tracking, and weight mismatches flag the cart.
           </p>
         </div>
         <Link
@@ -63,7 +63,7 @@ async function StoreHome() {
           <article key={card.cartId} className="rounded-2xl border border-stone-200 bg-white p-4">
             <div className="flex items-center justify-between gap-2">
               <h2 className="font-mono text-sm font-semibold">{card.cartId}</h2>
-              <Link href={`/cart/${card.cartId}`} className="text-sm font-medium text-teal-800">
+              <Link href={`/${card.cartId}`} className="text-sm font-medium text-teal-800">
                 Open
               </Link>
             </div>
@@ -88,9 +88,9 @@ async function StoreHome() {
           {products.map((product) => (
             <li key={product.id} className="px-4 py-3">
               <p className="font-medium">{product.name}</p>
-              <p className="font-mono text-xs text-stone-500">{product.rfidTag}</p>
+              <p className="font-mono text-xs text-stone-500">{product.rfidUid}</p>
               <p className="mt-1 text-sm text-stone-600">
-                {inr(product.price)} · {grams(product.expectedWeight)} · ±{grams(product.weightTolerance)}
+                {inr(Number(product.price))} · {grams(product.expectedWeight)} · ±{grams(product.weightTolerance)}
               </p>
             </li>
           ))}
@@ -99,7 +99,7 @@ async function StoreHome() {
           <table className="w-full min-w-[36rem] text-left text-sm">
             <thead className="text-xs uppercase tracking-wide text-stone-500">
               <tr>
-                <th className="px-4 py-2 font-medium">Tag</th>
+                <th className="px-4 py-2 font-medium">Tag / UID</th>
                 <th className="px-4 py-2 font-medium">Product</th>
                 <th className="px-4 py-2 font-medium">Price</th>
                 <th className="px-4 py-2 font-medium">Weight</th>
@@ -109,9 +109,9 @@ async function StoreHome() {
             <tbody className="divide-y divide-stone-200">
               {products.map((product) => (
                 <tr key={product.id}>
-                  <td className="px-4 py-3 font-mono text-xs">{product.rfidTag}</td>
+                  <td className="px-4 py-3 font-mono text-xs">{product.rfidUid}</td>
                   <td className="px-4 py-3">{product.name}</td>
-                  <td className="px-4 py-3">{inr(product.price)}</td>
+                  <td className="px-4 py-3">{inr(Number(product.price))}</td>
                   <td className="px-4 py-3">{grams(product.expectedWeight)}</td>
                   <td className="px-4 py-3">±{grams(product.weightTolerance)}</td>
                 </tr>

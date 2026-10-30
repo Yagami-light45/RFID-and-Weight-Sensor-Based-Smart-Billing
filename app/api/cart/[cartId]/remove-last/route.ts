@@ -1,5 +1,11 @@
 import { publishCartUpdate, removeLastItem } from "@/lib/cart";
-import { readBody, readCartId, readMeasuredWeight, withApi } from "@/lib/http";
+import {
+  readBody,
+  readCartId,
+  readEventId,
+  readMeasuredWeight,
+  withApi,
+} from "@/lib/http";
 
 export async function POST(
   request: Request,
@@ -11,6 +17,7 @@ export async function POST(
     const result = await removeLastItem(
       readCartId(cartId),
       readMeasuredWeight(body),
+      readEventId(body),
     );
     await publishCartUpdate(result.cart);
     return Response.json(result.body, { status: result.status });

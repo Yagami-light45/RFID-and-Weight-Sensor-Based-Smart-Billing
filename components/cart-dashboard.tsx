@@ -72,7 +72,15 @@ export function CartDashboard({ cartId }: { cartId: string }) {
       gotCart = true;
       setCart(next);
       setError(null);
-      setReceipt((current) => (next.status === "CHECKED_OUT" ? current : null));
+      if (next.status === "CHECKED_OUT" && next.transaction) {
+        setReceipt({
+          reference: next.transaction.reference,
+          paymentMethod: next.transaction.paymentMethod as PaymentMethod,
+          total: next.transaction.finalTotal,
+        });
+      } else {
+        setReceipt((current) => (next.status === "CHECKED_OUT" ? current : null));
+      }
     };
 
     source.onopen = () => {
@@ -162,6 +170,15 @@ export function CartDashboard({ cartId }: { cartId: string }) {
           <span className="rounded-full bg-stone-900 px-3 py-1 font-mono text-sm font-medium text-white">
             {cart.cartId}
           </span>
+          {cart.sessionId ? (
+            <span
+              className="inline-flex items-center gap-1 rounded-full bg-stone-100 px-3 py-1 font-mono text-xs text-stone-600"
+              title={`Active Session: ${cart.sessionId}`}
+            >
+              <span className="font-sans text-stone-400">Session:</span>
+              <span>{cart.sessionId.slice(-8)}</span>
+            </span>
+          ) : null}
           <span
             className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-sm ${
               online ? "bg-teal-50 text-teal-800" : "bg-amber-50 text-amber-800"
@@ -261,7 +278,7 @@ export function CartDashboard({ cartId }: { cartId: string }) {
               >
                 <div className="col-span-2 min-w-0 sm:col-span-1">
                   <p className="truncate font-medium">{item.name}</p>
-                  <p className="font-mono text-xs text-stone-500">{item.rfidTag}</p>
+                  <p className="font-mono text-xs text-stone-500">{item.rfidUid || item.rfidTag}</p>
                 </div>
                 <p className="text-sm text-stone-700">
                   <span className="text-stone-500 sm:hidden">Price </span>

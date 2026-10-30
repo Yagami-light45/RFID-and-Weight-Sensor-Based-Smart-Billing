@@ -1,6 +1,6 @@
 import { unstable_rethrow } from "next/navigation";
 import { isCartId } from "@/lib/ids";
-import type { PaymentMethod } from "@/lib/types";
+import type { PaymentMethod, ScanAction } from "@/lib/types";
 
 export class HttpError extends Error {
   constructor(
@@ -59,15 +59,35 @@ export function readMeasuredWeight(body: unknown) {
   return value;
 }
 
-export function readRfidTag(body: unknown) {
-  if (!body || typeof body !== "object" || !("rfidTag" in body)) {
-    throw new HttpError(400, "rfidTag is required");
+export function readRfidUid(body: unknown): string {
+  if (!body || typeof body !== "object") {
+    throw new HttpError(400, "rfidUid or rfidTag is required");
   }
-  const value = (body as { rfidTag: unknown }).rfidTag;
+  const b = body as Record<string, unknown>;
+  const value = b.rfidUid ?? b.rfidTag;
   if (typeof value !== "string" || value.trim() === "") {
-    throw new HttpError(400, "rfidTag must be a non-empty string");
+    throw new HttpError(400, "rfidUid or rfidTag must be a non-empty string");
   }
   return value.trim();
+}
+
+/** Backward compatibility alias for readRfidUid */
+export const readRfidTag = readRfidUid;
+
+export function readEventId(body: unknown): string | undefined {
+  if (!body || typeof body !== "object") return undefined;
+  const value = (body as Record<string, unknown>).eventId;
+  if (typeof value === "string" && value.trim() !== "") {
+    return value.trim();
+  }
+  return undefined;
+}
+
+export function readAction(body: unknown): ScanAction {
+  if (!body || typeof body !== "object") return "ADD";
+  const value = (body as Record<string, unknown>).action;
+  if (value === "REMOVE") return "REMOVE";
+  return "ADD";
 }
 
 export function readPaymentMethod(body: unknown): PaymentMethod | undefined {

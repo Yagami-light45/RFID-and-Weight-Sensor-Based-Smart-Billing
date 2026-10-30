@@ -1,5 +1,12 @@
 import { publishCartUpdate, scanItem } from "@/lib/cart";
-import { readBody, readCartId, readMeasuredWeight, readRfidTag, withApi } from "@/lib/http";
+import {
+  readBody,
+  readCartId,
+  readEventId,
+  readMeasuredWeight,
+  readRfidUid,
+  withApi,
+} from "@/lib/http";
 
 export async function POST(
   request: Request,
@@ -10,8 +17,9 @@ export async function POST(
     const body = await readBody(request);
     const result = await scanItem(
       readCartId(cartId),
-      readRfidTag(body),
+      readRfidUid(body),
       readMeasuredWeight(body),
+      readEventId(body),
     );
     await publishCartUpdate(result.cart);
     return Response.json(result.body, { status: result.status });

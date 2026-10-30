@@ -101,7 +101,7 @@ export function AdminBoard() {
           {overview.carts.map((cart) => (
             <Link
               key={cart.cartId}
-              href={`/cart/${cart.cartId}`}
+              href={`/${cart.cartId}`}
               className={`rounded-2xl border bg-white p-4 hover:border-stone-400 ${
                 cart.hasMismatch ? "border-red-300" : "border-stone-200"
               }`}

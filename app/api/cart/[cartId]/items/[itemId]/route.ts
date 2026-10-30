@@ -1,5 +1,11 @@
 import { publishCartUpdate, removeCartItem } from "@/lib/cart";
-import { readBody, readCartId, readMeasuredWeight, withApi } from "@/lib/http";
+import {
+  readBody,
+  readCartId,
+  readEventId,
+  readMeasuredWeight,
+  withApi,
+} from "@/lib/http";
 
 export async function DELETE(
   request: Request,
@@ -18,6 +24,7 @@ export async function DELETE(
       readCartId(cartId),
       itemId,
       readMeasuredWeight(body),
+      readEventId(body),
     );
     await publishCartUpdate(result.cart);
     return Response.json(result.body, { status: result.status });
