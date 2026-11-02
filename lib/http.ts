@@ -96,6 +96,6 @@ export function readPaymentMethod(body: unknown): PaymentMethod | undefined {
   }
   const value = (body as { paymentMethod: unknown }).paymentMethod;
   if (value === undefined || value === null || value === "") return undefined;
-  if (value === "UPI" || value === "CARD") return value;
-  throw new HttpError(400, "paymentMethod must be UPI or CARD");
+  if (value === "CASH" || value === "CARD" || value === "UPI") return value;
+  throw new HttpError(400, "paymentMethod must be CASH, CARD, or UPI");
 }

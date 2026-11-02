@@ -28,7 +28,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="flex min-h-full flex-col bg-stone-100 font-sans text-stone-900">
-        <header className="border-b border-stone-200 bg-white">
+        <header className="border-b border-stone-200 bg-white no-print">
           <div className="mx-auto flex w-full max-w-5xl items-center justify-between gap-4 px-4 py-3">
             <Link href="/" className="font-semibold tracking-tight">
               Smart Billing

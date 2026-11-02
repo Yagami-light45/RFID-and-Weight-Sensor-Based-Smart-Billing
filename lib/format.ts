@@ -1,9 +1,11 @@
 import type { CartStatus } from "@/lib/types";
 
 export function statusText(status: CartStatus) {
-  if (status === "CHECKED_OUT") return "Checked out";
-  if (status === "FLAGGED_MISMATCH") return "Flagged";
-  return "Active";
+  if (status === "CHECKED_OUT") return "Paid & Completed";
+  if (status === "PAYMENT_PENDING") return "Payment Pending at Counter";
+  if (status === "BILL_GENERATED") return "Bill Generated";
+  if (status === "FLAGGED_MISMATCH") return "Weight Mismatch";
+  return "Shopping Active";
 }
 
 export function inr(amount: number) {
@@ -25,5 +27,12 @@ export function clock(iso: string) {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
+  }).format(new Date(iso));
+}
+
+export function fullDateTime(iso: string) {
+  return new Intl.DateTimeFormat("en-IN", {
+    dateStyle: "medium",
+    timeStyle: "short",
   }).format(new Date(iso));
 }

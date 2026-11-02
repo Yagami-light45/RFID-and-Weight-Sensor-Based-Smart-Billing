@@ -8,3 +8,29 @@
 body {
   font-family: var(--font-sans), sans-serif;
 }
+
+@media print {
+  body {
+    background-color: #ffffff !important;
+    color: #000000 !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .printable-bill {
+    border: 1px solid #e5e5e5 !important;
+    box-shadow: none !important;
+    padding: 1.5rem !important;
+    margin: 0 auto !important;
+    width: 100% !important;
+    max-width: 800px !important;
+    page-break-inside: avoid;
+  }
+
+  header, nav, footer {
+    display: none !important;
+  }
+}
+

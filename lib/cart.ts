@@ -3,9 +3,12 @@ import { prisma } from "@/lib/prisma";
 import { HttpError } from "@/lib/http";
 import { ADMIN_CHANNEL, cartChannel, publish } from "@/lib/realtime";
 import type {
+  BillHistoryItem,
+  BillStatus,
   CartPayload,
   OverviewPayload,
   PaymentMethod,
+  PaymentStatus,
   ScanAction,
 } from "@/lib/types";
 
@@ -65,11 +68,16 @@ export function toPayload(session: SessionRecord): CartPayload {
   }));
 
   const isCheckedOut = session.status === "COMPLETED";
+  const isPaymentPending =
+    session.status === "PAYMENT_PENDING" || session.status === "BILL_GENERATED";
+
   const status: CartPayload["status"] = isCheckedOut
     ? "CHECKED_OUT"
-    : session.hasMismatch
-      ? "FLAGGED_MISMATCH"
-      : "ACTIVE";
+    : isPaymentPending
+      ? "PAYMENT_PENDING"
+      : session.hasMismatch
+        ? "FLAGGED_MISMATCH"
+        : "ACTIVE";
 
   return {
     cartId: session.cartId,
@@ -90,13 +98,24 @@ export function toPayload(session: SessionRecord): CartPayload {
     transaction: session.transaction
       ? {
           id: session.transaction.id,
+          billNumber:
+            session.transaction.billNumber ||
+            session.transaction.reference ||
+            `BILL-${session.cartId}-${session.transaction.id.slice(-6).toUpperCase()}`,
           reference: session.transaction.reference,
-          paymentMethod: session.transaction.paymentMethod,
-          paymentStatus: session.transaction.paymentStatus,
+          paymentMethod: (session.transaction.paymentMethod as PaymentMethod) || null,
+          paymentStatus: (session.transaction.paymentStatus as PaymentStatus) || "PENDING",
+          billStatus: (session.transaction.billStatus as BillStatus) || "PENDING",
           subtotal: Number(session.transaction.subtotal),
           tax: Number(session.transaction.tax),
           discount: Number(session.transaction.discount),
           finalTotal: Number(session.transaction.finalTotal),
+          cashierConfirmedAt: session.transaction.cashierConfirmedAt
+            ? session.transaction.cashierConfirmedAt.toISOString()
+            : null,
+          createdAt: session.transaction.createdAt
+            ? session.transaction.createdAt.toISOString()
+            : session.transaction.timestamp.toISOString(),
           timestamp: session.transaction.timestamp.toISOString(),
         }
       : null,
@@ -135,17 +154,20 @@ async function getOrCreateCart(tx: Tx, cartId: string) {
 }
 
 /**
- * Enforce at most one ACTIVE shopping session per trolley through transactional logic.
+ * Enforce at most one ACTIVE / open shopping session per trolley through transactional logic.
  */
 async function getOrCreateActiveSession(tx: Tx, cartId: string) {
   await getOrCreateCart(tx, cartId);
 
-  // Look for current ACTIVE session
-  const activeSession = await tx.shoppingSession.findFirst({
-    where: { cartId, status: "ACTIVE" },
+  // Look for current open session (ACTIVE or PAYMENT_PENDING/BILL_GENERATED)
+  const openSession = await tx.shoppingSession.findFirst({
+    where: {
+      cartId,
+      status: { in: ["ACTIVE", "PAYMENT_PENDING", "BILL_GENERATED"] },
+    },
     include: sessionInclude,
   });
-  if (activeSession) return activeSession;
+  if (openSession) return openSession;
 
   // Otherwise, create a new ACTIVE session
   return tx.shoppingSession.create({
@@ -163,12 +185,15 @@ async function getOrCreateActiveSession(tx: Tx, cartId: string) {
 async function getCurrentOrNewSession(tx: Tx, cartId: string) {
   await getOrCreateCart(tx, cartId);
 
-  // First, look for an active session
-  const activeSession = await tx.shoppingSession.findFirst({
-    where: { cartId, status: "ACTIVE" },
+  // First, look for an open session
+  const openSession = await tx.shoppingSession.findFirst({
+    where: {
+      cartId,
+      status: { in: ["ACTIVE", "PAYMENT_PENDING", "BILL_GENERATED"] },
+    },
     include: sessionInclude,
   });
-  if (activeSession) return activeSession;
+  if (openSession) return openSession;
 
   // Next, look for the most recent session (e.g. recently checked out)
   const latestSession = await tx.shoppingSession.findFirst({
@@ -226,6 +251,8 @@ async function recalculateSessionTotals(
       totalExpectedWeight,
       currentMeasuredWeight: roundGrams(measuredWeight),
       hasMismatch: mismatch,
+      // If customer was in PAYMENT_PENDING and scans more items, move back to ACTIVE
+      status: mismatch ? "ACTIVE" : undefined,
     },
     include: sessionInclude,
   });
@@ -606,27 +633,35 @@ export async function removeCartItem(
   }, TX_CONFIG);
 }
 
-export async function checkoutCart(
-  cartId: string,
-  measuredWeight: number,
-  paymentMethod?: PaymentMethod,
-) {
+/**
+ * Generate Final Bill for the Customer.
+ * Verifies load cell weight, calculates tax/discounts, creates pending bill record.
+ * DOES NOT mark session as completed or paid.
+ */
+export async function generateFinalBill(cartId: string, measuredWeight?: number) {
   return prisma.$transaction(async (tx) => {
     const session = await getOrCreateActiveSession(tx, cartId);
     assertOpenSession(session);
-    if (session.items.length === 0) throw new HttpError(400, "Cart is empty");
+    if (session.items.length === 0) {
+      throw new HttpError(400, "Cannot generate bill for an empty cart");
+    }
+
+    const actualWeight =
+      typeof measuredWeight === "number" && Number.isFinite(measuredWeight)
+        ? measuredWeight
+        : session.currentMeasuredWeight;
 
     const tolerance = Math.max(
       ...session.items.map((item) => item.product.weightTolerance),
     );
 
     if (
-      exceedsTolerance(measuredWeight, session.totalExpectedWeight, tolerance)
+      exceedsTolerance(actualWeight, session.totalExpectedWeight, tolerance)
     ) {
       const updated = await recalculateSessionTotals(
         tx,
         session.id,
-        measuredWeight,
+        actualWeight,
         true,
       );
       return result(
@@ -634,52 +669,56 @@ export async function checkoutCart(
         {
           status: "FLAGGED",
           alertBuzzer: true,
-          message: "Weight mismatch. Cart flagged for cashier audit.",
+          message: "Weight mismatch. Please verify items before generating bill.",
         },
         updated,
       );
     }
 
-    if (!paymentMethod) {
-      const updated = await recalculateSessionTotals(
-        tx,
-        session.id,
-        measuredWeight,
-        false,
-      );
-      return result(
-        200,
-        {
-          status: "VERIFIED",
-          total: Number(updated.totalPrice),
-          message: "Weight verified. Choose a payment method.",
-        },
-        updated,
-      );
-    }
+    // Calculations
+    const subtotal = roundMoney(Number(session.totalPrice));
+    const tax = roundMoney(subtotal * 0.05); // Standard 5% GST
+    const discount = 0;
+    const finalTotal = roundMoney(subtotal + tax - discount);
 
-    // Complete session and record Transaction
-    const reference = `PAY-${cartId}-${Date.now().toString(36).toUpperCase()}`;
-
-    await tx.transaction.create({
-      data: {
-        sessionId: session.id,
-        subtotal: session.totalPrice,
-        tax: new Prisma.Decimal(0),
-        discount: new Prisma.Decimal(0),
-        finalTotal: session.totalPrice,
-        paymentMethod,
-        paymentStatus: "PAID",
-        reference,
-      },
+    // Look for existing transaction or create new one
+    let txRecord = await tx.transaction.findUnique({
+      where: { sessionId: session.id },
     });
+
+    if (!txRecord) {
+      const billNumber = `BILL-${cartId}-${Date.now().toString(36).toUpperCase()}`;
+      txRecord = await tx.transaction.create({
+        data: {
+          sessionId: session.id,
+          billNumber,
+          subtotal: new Prisma.Decimal(subtotal),
+          tax: new Prisma.Decimal(tax),
+          discount: new Prisma.Decimal(discount),
+          finalTotal: new Prisma.Decimal(finalTotal),
+          billStatus: "PENDING",
+          paymentStatus: "PENDING",
+          paymentMethod: null,
+          reference: billNumber,
+        },
+      });
+    } else if (txRecord.paymentStatus !== "PAID") {
+      txRecord = await tx.transaction.update({
+        where: { id: txRecord.id },
+        data: {
+          subtotal: new Prisma.Decimal(subtotal),
+          tax: new Prisma.Decimal(tax),
+          discount: new Prisma.Decimal(discount),
+          finalTotal: new Prisma.Decimal(finalTotal),
+        },
+      });
+    }
 
     const updated = await tx.shoppingSession.update({
       where: { id: session.id },
       data: {
-        status: "COMPLETED",
-        completedAt: new Date(),
-        currentMeasuredWeight: roundGrams(measuredWeight),
+        status: "PAYMENT_PENDING",
+        currentMeasuredWeight: roundGrams(actualWeight),
         hasMismatch: false,
       },
       include: sessionInclude,
@@ -688,15 +727,136 @@ export async function checkoutCart(
     return result(
       200,
       {
-        status: "CHECKED_OUT",
-        paymentMethod,
-        reference,
-        total: Number(updated.totalPrice),
-        message: "Payment successful",
+        status: "BILL_GENERATED",
+        billNumber: txRecord.billNumber,
+        subtotal,
+        tax,
+        discount,
+        finalTotal,
+        message:
+          "Bill generated successfully. Please proceed to the billing counter to complete your payment.",
       },
       updated,
     );
   }, TX_CONFIG);
+}
+
+/**
+ * Cashier Physical Counter Payment Confirmation.
+ * Called ONLY by the cashier at the physical counter after receiving Cash, POS Card, or UPI payment.
+ */
+export async function confirmCashierPayment(
+  cartId: string,
+  paymentMethod: PaymentMethod,
+  reference?: string,
+) {
+  return prisma.$transaction(async (tx) => {
+    // Find open session
+    const session = await tx.shoppingSession.findFirst({
+      where: {
+        cartId,
+        status: { in: ["PAYMENT_PENDING", "BILL_GENERATED", "ACTIVE"] },
+      },
+      orderBy: { createdAt: "desc" },
+      include: sessionInclude,
+    });
+
+    if (!session) {
+      throw new HttpError(404, "No active session or bill found for this trolley");
+    }
+
+    if (session.items.length === 0) {
+      throw new HttpError(400, "Cannot complete checkout for an empty cart");
+    }
+
+    const subtotal = roundMoney(Number(session.totalPrice));
+    const tax = roundMoney(subtotal * 0.05);
+    const discount = 0;
+    const finalTotal = roundMoney(subtotal + tax - discount);
+    const finalReference =
+      reference || `PAY-${paymentMethod}-${cartId}-${Date.now().toString(36).toUpperCase()}`;
+
+    // Update or create Transaction
+    let txRecord = await tx.transaction.findUnique({
+      where: { sessionId: session.id },
+    });
+
+    if (txRecord) {
+      if (txRecord.paymentStatus === "PAID") {
+        throw new HttpError(409, "This bill has already been paid and completed");
+      }
+      txRecord = await tx.transaction.update({
+        where: { id: txRecord.id },
+        data: {
+          paymentMethod,
+          paymentStatus: "PAID",
+          billStatus: "PAID",
+          cashierConfirmedAt: new Date(),
+          reference: finalReference,
+          finalTotal: new Prisma.Decimal(finalTotal),
+        },
+      });
+    } else {
+      const billNumber = `BILL-${cartId}-${Date.now().toString(36).toUpperCase()}`;
+      txRecord = await tx.transaction.create({
+        data: {
+          sessionId: session.id,
+          billNumber,
+          subtotal: new Prisma.Decimal(subtotal),
+          tax: new Prisma.Decimal(tax),
+          discount: new Prisma.Decimal(discount),
+          finalTotal: new Prisma.Decimal(finalTotal),
+          paymentMethod,
+          paymentStatus: "PAID",
+          billStatus: "PAID",
+          cashierConfirmedAt: new Date(),
+          reference: finalReference,
+        },
+      });
+    }
+
+    // Complete session
+    const updated = await tx.shoppingSession.update({
+      where: { id: session.id },
+      data: {
+        status: "COMPLETED",
+        completedAt: new Date(),
+        hasMismatch: false,
+      },
+      include: sessionInclude,
+    });
+
+    return result(
+      200,
+      {
+        status: "COMPLETED",
+        billNumber: txRecord.billNumber,
+        paymentMethod,
+        reference: txRecord.reference,
+        total: Number(txRecord.finalTotal),
+        cashierConfirmedAt: txRecord.cashierConfirmedAt?.toISOString(),
+        message: `Payment confirmed via ${paymentMethod} by cashier. Billing completed.`,
+      },
+      updated,
+    );
+  }, TX_CONFIG);
+}
+
+/**
+ * Checkout / Bill Verification compatibility endpoint.
+ */
+export async function checkoutCart(
+  cartId: string,
+  measuredWeight: number,
+  paymentMethod?: PaymentMethod,
+) {
+  // If payment method is provided directly (e.g. from automated simulation), complete payment
+  if (paymentMethod) {
+    return confirmCashierPayment(cartId, paymentMethod);
+  }
+
+  // Otherwise, generate the final bill for counter payment
+  return generateFinalBill(cartId, measuredWeight);
 }
 
 /**
@@ -709,7 +869,10 @@ export async function resetCart(cartId: string) {
 
     // Mark any existing active sessions as ABANDONED (or COMPLETED if already checked out)
     const existingActive = await tx.shoppingSession.findMany({
-      where: { cartId, status: "ACTIVE" },
+      where: {
+        cartId,
+        status: { in: ["ACTIVE", "PAYMENT_PENDING", "BILL_GENERATED"] },
+      },
     });
 
     for (const active of existingActive) {
@@ -766,10 +929,20 @@ export async function getOverview(): Promise<OverviewPayload> {
     }
   }
 
-  // Calculate total revenue from all completed transactions
+  // Calculate total revenue from all confirmed transactions
   const transactions = await prisma.transaction.findMany({
     where: { paymentStatus: "PAID" },
+    include: {
+      session: {
+        include: {
+          items: true,
+        },
+      },
+    },
+    orderBy: { cashierConfirmedAt: "desc" },
+    take: 20,
   });
+
   const totalRevenue = roundMoney(
     transactions.reduce((sum, tx) => sum + Number(tx.finalTotal), 0),
   );
@@ -778,15 +951,43 @@ export async function getOverview(): Promise<OverviewPayload> {
     where: { status: "ACTIVE" },
   });
 
+  const pendingBillsCount = cartPayloads.filter(
+    (c) =>
+      c.sessionStatus === "PAYMENT_PENDING" ||
+      c.sessionStatus === "BILL_GENERATED",
+  ).length;
+
   const flaggedCartsCount = cartPayloads.filter(
     (c) => c.hasMismatch || c.status === "FLAGGED_MISMATCH",
   ).length;
 
+  const pendingBillsList = cartPayloads.filter(
+    (c) =>
+      c.sessionStatus === "PAYMENT_PENDING" ||
+      c.sessionStatus === "BILL_GENERATED",
+  );
+
+  const completedHistory: BillHistoryItem[] = transactions.map((t) => ({
+    id: t.id,
+    billNumber: t.billNumber || t.reference || `BILL-${t.id.slice(-6)}`,
+    cartId: t.session?.cartId || "N/A",
+    sessionId: t.sessionId,
+    finalTotal: Number(t.finalTotal),
+    paymentMethod: t.paymentMethod || "CASH",
+    cashierConfirmedAt: t.cashierConfirmedAt
+      ? t.cashierConfirmedAt.toISOString()
+      : t.timestamp.toISOString(),
+    itemCount: t.session?.items?.reduce((acc, i) => acc + i.quantity, 0) || 0,
+  }));
+
   return {
     totalRevenue,
     activeSessions: activeSessionsCount,
+    pendingBills: pendingBillsCount,
     flaggedCarts: flaggedCartsCount,
     carts: cartPayloads,
+    pendingBillsList,
+    completedHistory,
   };
 }
 
