@@ -1,9 +1,12 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  /* Allow access from your phone on campus Wi-Fi */
+  allowedDevOrigins: ["10.17.7.250"],
+
   cacheComponents: true,
   partialPrefetching: true,
+
   turbopack: {
     rules: {
       "*.css": {
@@ -12,6 +15,7 @@ const nextConfig: NextConfig = {
       },
     },
   },
+
   async redirects() {
     return [
       {
