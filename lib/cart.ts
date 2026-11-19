@@ -417,26 +417,14 @@ export async function scanItem(
     const nextExpected = roundGrams(
       session.totalExpectedWeight + product.expectedWeight,
     );
-    if (exceedsTolerance(measuredWeight, nextExpected, product.weightTolerance)) {
-      await recordScanEvent(
-        tx,
-        session.id,
-        rfidUid,
-        "ADD",
-        measuredWeight,
-        "MISMATCH",
-        eventId,
-      );
-      const updated = await recalculateSessionTotals(
-        tx,
-        session.id,
-        measuredWeight,
-        true,
-      );
-      return result(200, { status: "MISMATCH", alertBuzzer: true }, updated);
-    }
+    const mismatch = exceedsTolerance(
+      measuredWeight,
+      nextExpected,
+      product.weightTolerance,
+    );
 
-    // Within weight tolerance -> SUCCESS
+    // Registered RFID products are added regardless of weight mismatch.
+    // The mismatch still flags the cart for the website to display.
     const existingItem = session.items.find(
       (item) => item.productId === product.id,
     );
@@ -472,20 +460,21 @@ export async function scanItem(
       rfidUid,
       "ADD",
       measuredWeight,
-      "SUCCESS",
+      mismatch ? "MISMATCH" : "SUCCESS",
       eventId,
     );
     const updated = await recalculateSessionTotals(
       tx,
       session.id,
       measuredWeight,
-      false,
+      mismatch,
     );
 
     return result(
       200,
       {
-        status: "SUCCESS",
+        status: mismatch ? "MISMATCH" : "SUCCESS",
+        alertBuzzer: mismatch,
         product: product.name,
         total: Number(updated.totalPrice),
       },
@@ -992,6 +981,13 @@ export async function getOverview(): Promise<OverviewPayload> {
 }
 
 export async function publishCartUpdate(cart: CartPayload) {
+  // [TROLLEY LIVE LOGS] Publishing events is not proof a browser received them.
   publish(cartChannel(cart.cartId), "cart", cart);
   publish(ADMIN_CHANNEL, "overview", await getOverview());
+  console.log("[WEBSITE UPDATE PUBLISHED]", {
+    time: new Date().toISOString(),
+    cartId: cart.cartId, status: cart.status,
+    itemCount: cart.itemCount, totalPriceINR: cart.totalPrice,
+    hasMismatch: cart.hasMismatch,
+  });
 }
