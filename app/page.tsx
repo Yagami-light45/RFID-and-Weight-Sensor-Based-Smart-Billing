@@ -1,6 +1,5 @@
 import { Suspense } from "react";
 import Link from "next/link";
-import { connection } from "next/server";
 import { headers } from "next/headers";
 import QRCode from "qrcode";
 import { prisma } from "@/lib/prisma";
@@ -11,6 +10,33 @@ export const metadata = {
   description: "RFID and weight-sensor billing for shopping trolleys",
 };
 
+const qrCache = new Map<string, string>();
+let cachedStoreHome: {
+  products: Awaited<ReturnType<typeof prisma.product.findMany>>;
+  carts: Awaited<ReturnType<typeof prisma.cart.findMany>>;
+  timestamp: number;
+} | null = null;
+
+async function getQrCode(href: string): Promise<string> {
+  const cached = qrCache.get(href);
+  if (cached) return cached;
+  const qr = await QRCode.toDataURL(href, { margin: 1, width: 168 });
+  qrCache.set(href, qr);
+  return qr;
+}
+
+async function getStoreData() {
+  if (cachedStoreHome && Date.now() - cachedStoreHome.timestamp < 10000) {
+    return cachedStoreHome;
+  }
+  const [products, carts] = await Promise.all([
+    prisma.product.findMany({ orderBy: { name: "asc" } }),
+    prisma.cart.findMany({ orderBy: { cartId: "asc" } }),
+  ]);
+  cachedStoreHome = { products, carts, timestamp: Date.now() };
+  return cachedStoreHome;
+}
+
 export default function HomePage() {
   return (
     <Suspense fallback={<p className="text-sm text-stone-600">Loading store…</p>}>
@@ -20,22 +46,18 @@ export default function HomePage() {
 }
 
 async function StoreHome() {
-  await connection();
   const headerList = await headers();
   const host = headerList.get("x-forwarded-host") ?? headerList.get("host") ?? "localhost:3000";
   const proto = headerList.get("x-forwarded-proto") ?? "http";
   const base = `${proto}://${host}`;
 
-  const [products, carts] = await Promise.all([
-    prisma.product.findMany({ orderBy: { name: "asc" } }),
-    prisma.cart.findMany({ orderBy: { cartId: "asc" } }),
-  ]);
+  const { products, carts } = await getStoreData();
 
   const cartIds = carts.length > 0 ? carts.map((cart) => cart.cartId) : ["CART_01", "CART_02", "CART_03"];
   const cards = await Promise.all(
     cartIds.map(async (cartId) => {
       const href = `${base}/${cartId}`;
-      const qr = await QRCode.toDataURL(href, { margin: 1, width: 168 });
+      const qr = await getQrCode(href);
       return { cartId, href, qr };
     }),
   );

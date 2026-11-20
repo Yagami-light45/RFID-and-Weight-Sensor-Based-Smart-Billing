@@ -318,11 +318,53 @@ function result(
   return { status, body, cart: toPayload(session) };
 }
 
+// In-memory cache for ultra-fast page navigation & deduplicating simultaneous requests
+let cachedOverview: { data: OverviewPayload; timestamp: number } | null = null;
+const cartCache = new Map<string, { data: CartPayload; timestamp: number }>();
+const CACHE_TTL_MS = 3000; // 3 seconds TTL
+
+export function invalidateCache(cartId?: string) {
+  cachedOverview = null;
+  if (cartId) {
+    cartCache.delete(cartId);
+  } else {
+    cartCache.clear();
+  }
+}
+
 export async function getCart(cartId: string) {
-  const session = await prisma.$transaction(async (tx) => {
-    return getCurrentOrNewSession(tx, cartId);
-  }, TX_CONFIG);
-  return toPayload(session);
+  const cached = cartCache.get(cartId);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  // Fast direct read without interactive transaction overhead
+  let session = await prisma.shoppingSession.findFirst({
+    where: {
+      cartId,
+      status: { in: ["ACTIVE", "PAYMENT_PENDING", "BILL_GENERATED"] },
+    },
+    include: sessionInclude,
+  });
+
+  if (!session) {
+    session = await prisma.shoppingSession.findFirst({
+      where: { cartId },
+      orderBy: { createdAt: "desc" },
+      include: sessionInclude,
+    });
+  }
+
+  // If still no session, create one safely
+  if (!session) {
+    session = await prisma.$transaction(async (tx) => {
+      return getCurrentOrNewSession(tx, cartId);
+    }, TX_CONFIG);
+  }
+
+  const payload = toPayload(session);
+  cartCache.set(cartId, { data: payload, timestamp: Date.now() });
+  return payload;
 }
 
 export async function scanItem(
@@ -888,57 +930,62 @@ export async function resetCart(cartId: string) {
 }
 
 export async function getOverview(): Promise<OverviewPayload> {
-  const carts = await prisma.cart.findMany({
-    orderBy: { cartId: "asc" },
-  });
-
-  const cartPayloads: CartPayload[] = [];
-  for (const cart of carts) {
-    const session = await prisma.shoppingSession.findFirst({
-      where: { cartId: cart.cartId },
-      orderBy: { createdAt: "desc" },
-      include: sessionInclude,
-    });
-    if (session) {
-      cartPayloads.push(toPayload(session));
-    } else {
-      cartPayloads.push({
-        cartId: cart.cartId,
-        cartCode: cart.cartCode,
-        operationalStatus: cart.operationalStatus,
-        status: "ACTIVE",
-        totalPrice: 0,
-        totalExpectedWeight: 0,
-        currentMeasuredWeight: 0,
-        hasMismatch: false,
-        updatedAt: cart.updatedAt.toISOString(),
-        itemCount: 0,
-        items: [],
-      });
-    }
+  if (cachedOverview && Date.now() - cachedOverview.timestamp < CACHE_TTL_MS) {
+    return cachedOverview.data;
   }
 
-  // Calculate total revenue from all confirmed transactions
-  const transactions = await prisma.transaction.findMany({
-    where: { paymentStatus: "PAID" },
-    include: {
-      session: {
-        include: {
-          items: true,
+  // Fetch all carts with their latest session, transactions, and session count in parallel
+  const [carts, transactions, activeSessionsCount] = await Promise.all([
+    prisma.cart.findMany({
+      orderBy: { cartId: "asc" },
+      include: {
+        sessions: {
+          orderBy: { createdAt: "desc" },
+          take: 1,
+          include: sessionInclude,
         },
       },
-    },
-    orderBy: { cashierConfirmedAt: "desc" },
-    take: 20,
+    }),
+    prisma.transaction.findMany({
+      where: { paymentStatus: "PAID" },
+      include: {
+        session: {
+          include: {
+            items: true,
+          },
+        },
+      },
+      orderBy: { cashierConfirmedAt: "desc" },
+      take: 20,
+    }),
+    prisma.shoppingSession.count({
+      where: { status: "ACTIVE" },
+    }),
+  ]);
+
+  const cartPayloads: CartPayload[] = carts.map((cart) => {
+    const session = cart.sessions[0];
+    if (session) {
+      return toPayload(session);
+    }
+    return {
+      cartId: cart.cartId,
+      cartCode: cart.cartCode,
+      operationalStatus: cart.operationalStatus,
+      status: "ACTIVE",
+      totalPrice: 0,
+      totalExpectedWeight: 0,
+      currentMeasuredWeight: 0,
+      hasMismatch: false,
+      updatedAt: cart.updatedAt.toISOString(),
+      itemCount: 0,
+      items: [],
+    };
   });
 
   const totalRevenue = roundMoney(
     transactions.reduce((sum, tx) => sum + Number(tx.finalTotal), 0),
   );
-
-  const activeSessionsCount = await prisma.shoppingSession.count({
-    where: { status: "ACTIVE" },
-  });
 
   const pendingBillsCount = cartPayloads.filter(
     (c) =>
@@ -969,7 +1016,7 @@ export async function getOverview(): Promise<OverviewPayload> {
     itemCount: t.session?.items?.reduce((acc, i) => acc + i.quantity, 0) || 0,
   }));
 
-  return {
+  const data: OverviewPayload = {
     totalRevenue,
     activeSessions: activeSessionsCount,
     pendingBills: pendingBillsCount,
@@ -978,12 +1025,19 @@ export async function getOverview(): Promise<OverviewPayload> {
     pendingBillsList,
     completedHistory,
   };
+
+  cachedOverview = { data, timestamp: Date.now() };
+  return data;
 }
 
 export async function publishCartUpdate(cart: CartPayload) {
+  invalidateCache(cart.cartId);
+  cartCache.set(cart.cartId, { data: cart, timestamp: Date.now() });
+
   // [TROLLEY LIVE LOGS] Publishing events is not proof a browser received them.
   publish(cartChannel(cart.cartId), "cart", cart);
-  publish(ADMIN_CHANNEL, "overview", await getOverview());
+  const overview = await getOverview();
+  publish(ADMIN_CHANNEL, "overview", overview);
   console.log("[WEBSITE UPDATE PUBLISHED]", {
     time: new Date().toISOString(),
     cartId: cart.cartId, status: cart.status,

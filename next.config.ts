@@ -2,10 +2,10 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   /* Allow access from your phone on campus Wi-Fi */
-  allowedDevOrigins: ["10.17.1.156"],    //IMP : find your ip and put it here..
+  allowedDevOrigins: ["10.202.3.210"],    //IMP : find your ip and put it here..
 
-  cacheComponents: true,
-  partialPrefetching: true,
+  cacheComponents: false,
+  partialPrefetching: false,
 
   turbopack: {
     rules: {
