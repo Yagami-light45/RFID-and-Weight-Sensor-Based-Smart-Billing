@@ -1,224 +1,369 @@
-# Smart Billing Trolley
+# Smart Billing Trolley 🛒⚡
+### RFID & Weight-Sensor Based Intelligent Retail Checkout System
+**Instrumentation & Control Systems · Team 2**  
+**Indian Institute of Technology Indore (IIT Indore)**
 
-A shopping trolley bills itself. An ESP32 reads an RFID tag and the load-cell weight, then posts both to this app. The server adds the product only when the scale matches the expected weight, and the trolley's web page updates live.
+---
 
-Three seeded trolleys are ready to use: `CART_01`, `CART_02`, and `CART_03`.
+## 👥 Project Team
+* **Boddu Kunal** (240003020)
+* **Harshith Pasupuleti** (240003034)
+* **Dantuluri Sai Harshit Varma** (240003024)
+* **Kathi Tagore Chandra** (240003039)
+* **Nanavath Vishwanath Rathod** (240003049)
 
-## Start the app
+**Repository**: [GitHub — RFID-and-Weight-Sensor-Based-Smart-Billing](https://github.com/Yagami-light45/RFID-and-Weight-Sensor-Based-Smart-Billing)
 
-You need Node.js and a running Postgres. The local database is already created.
+---
 
+## 📌 Executive Summary & Problem Solved
+
+Traditional supermarket checkouts require manual scanning of every individual item at a central billing counter. This creates severe checkout queues during peak hours, increases labor overhead, allows accidental miss-scans or theft, and leaves customers without a real-time running total until the final receipt is printed.
+
+The **Smart Billing Trolley** eliminates checkout queues by enabling in-cart automated billing. By combining **13.56 MHz RFID tag identification** with a **high-precision 24-bit strain-gauge load cell**, the system achieves **closed-loop dual verification**:
+1. **RFID Reading** confirms which item was added or removed.
+2. **Continuous Load-Cell Weighing** physically verifies that the item placed in the basket matches its expected catalogue weight.
+3. **Live Cloud Synchronization** pushes instantaneous cart and billing updates to the customer's smartphone and store cashier dashboard over **Server-Sent Events (SSE)**.
+
+---
+
+## 🚀 Key Features
+
+### 1. Dual-Sensor Anti-Theft Verification
+* **Closed-Loop Cross Checking**: An item is only validated when both RFID identification and physical weight delta match within designated tolerances (e.g., $\pm 15\text{ g}$).
+* **Instant Discrepancy Detection**: Unscanned items placed in the basket or scanned items withheld from the basket trigger an alert buzzer flag on the ESP32 and visually flag the cart in orange/red on customer and cashier screens.
+* **Item-Specific Weight Tolerances**: Configurable weight boundaries per item (e.g., standard items $\pm 15\text{ g}$, delicate/natural produce like eggs $\pm 20\text{ g}$).
+
+### 2. Embedded Hardware & Firmware Precision
+* **ESP32 DevKit V1 Microcontroller**: High-speed dual-core processing driving Wi-Fi HTTP client communication, SPI RFID reading, I2C LCD interfacing, and load cell signal acquisition.
+* **HX711 24-bit ADC**: Precision analog-to-digital bridge converter digitizing micro-volt strain gauge variations with exceptional resolution.
+* **Real-Time Signal Filtering**: Firmware implements exponential smoothing filters ($\alpha = 0.90$) and a $4\text{ g}$ deadband zero-clamp to eliminate baseline thermal drift and bench vibrations.
+* **16×2 Character LCD Screen**: Live onboard feedback showing current basket weight, scanned tag UID, product name, and total item count directly on the trolley.
+* **Movement & Stability Detection**: Firmware dynamically waits for basket movement to settle before capturing stable weight and posting data to the cloud.
+
+### 3. Real-Time Customer Web Dashboard (`/[cartId]`)
+* **Instant Trolley Access via QR Code**: Each physical trolley carries a custom QR code label that instantly opens that cart’s live web dashboard on any mobile smartphone.
+* **Server-Sent Events (SSE) Live Feed**: Cart items, quantities, weights, and subtotals update instantaneously without requiring page refreshes.
+* **Live Running Total & GST Calculation**: Continuous calculation of subtotal, 5% standard GST, and final payable amount.
+* **Item Removal Management**: Shoppers can delete items directly from the web interface or via an onboard hardware remove button.
+* **Digital Tax Invoice Generation**: Produces a clean, formatted, printable/downloadable digital bill and unique invoice number (`BILL-<cartId>-XXXXXX`).
+
+### 4. Enterprise Cashier & Admin Board (`/admin`)
+* **Fleet Overview**: Live monitoring of all store trolleys simultaneously with active status, current weights, and session states.
+* **Instant Fraud & Mismatch Alerts**: Flagged carts are highlighted with visual alerts, alerting cashiers to verify item contents before releasing carts.
+* **Counter Payment Confirmation**: Cashiers finalize bills with flexible physical counter payment options:
+  * **Cash** (with cash drawer reference notes)
+  * **Card** (physical store POS terminal authorization code)
+  * **UPI** (in-store counter QR code transaction UTR)
+* **Revenue & Sales Analytics**: Real-time aggregation of store revenue, active shopping sessions, pending payments, and historical transaction logs.
+
+---
+
+## 📐 System Architecture
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        PHYSICAL SMART TROLLEY                          │
+│                                                                        │
+│   ┌────────────────────┐                   ┌───────────────────────┐   │
+│   │  MFRC522 RFID      │                   │ 4-Wire Strain Gauge   │   │
+│   │  Reader (13.56MHz) │                   │ Load Cell (0-5 kg)    │   │
+│   └─────────┬──────────┘                   └───────────┬───────────┘   │
+│             │ SPI                                      │ Bridge        │
+│             │                                          ▼               │
+│             │                              ┌───────────────────────┐   │
+│             │                              │ HX711 24-Bit ADC      │   │
+│             │                              └───────────┬───────────┘   │
+│             ▼                                          │ Serial DT/SCK │
+│   ┌────────────────────────────────────────────────────▼───────────┐   │
+│   │                     ESP32 DevKit V1 Board                      │   │
+│   │    - Real-Time Exponential Filter (α = 0.90)                   │   │
+│   │    - Movement & Stability Settling Engine                      │   │
+│   │    - HTTP Client (JSON Scans, Retries, Idempotent Events)      │   │
+│   └───────────────┬────────────────────────────────────┬───────────┘   │
+│                   │ I2C Bus                            │ Wi-Fi         │
+│                   ▼                                    │ HTTP POST     │
+│   ┌───────────────────────────────┐                    │               │
+│   │ 16×2 I2C LCD Onboard Display  │                    │               │
+│   └───────────────────────────────┘                    │               │
+└────────────────────────────────────────────────────────┼───────────────┘
+                                                         │
+                                                         ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                      CLOUD & BACKEND PLATFORM                          │
+│                                                                        │
+│   ┌────────────────────────────────────────────────────────────────┐   │
+│   │ Next.js 16 REST APIs + Server-Sent Events (SSE) Engine         │   │
+│   │   - Weight Tolerance Verification Engine                       │   │
+│   │   - Active Shopping Session Management                         │   │
+│   │   - Tax & Dynamic Billing Engine                               │   │
+│   └───────────────────────────────┬────────────────────────────────┘   │
+│                                   │ Prisma ORM                         │
+│                                   ▼                                    │
+│   ┌────────────────────────────────────────────────────────────────┐   │
+│   │ PostgreSQL Database (Neon Cloud / Local)                       │   │
+│   │   - Models: Cart, Product, Session, CartItem, Event, Payment   │   │
+│   └───────────────────────────────┬────────────────────────────────┘   │
+│                                   │ Real-Time Broadcast (SSE)          │
+│                   ┌───────────────┴───────────────┐                    │
+│                   ▼                               ▼                    │
+│   ┌───────────────────────────────┐ ┌──────────────────────────────┐   │
+│   │ Customer Mobile Dashboard     │ │ Cashier / Admin Store Board  │   │
+│   │ (Live Running Bill & QR view) │ │ (Fleet Monitor & Settlement) │   │
+│   └───────────────────────────────┘ └──────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🧮 Mathematical Modeling & Signal Processing
+
+The firmware and backend use six core equations to guarantee weighing accuracy and stability:
+
+### 1. Raw ADC Counts to Grams Conversion
+$$W = \frac{R - R_0}{k}$$
+* $R$: Current raw 24-bit reading from HX711 ADC.
+* $R_0$: Tare offset calculated from a 50-sample moving average with an empty basket.
+* $k$: Scale calibration factor (Bench calibrated to $-63.09\text{ counts/gram}$).
+
+### 2. First-Order Exponential Smoothing Filter
+$$W_f = \alpha W + (1 - \alpha) W'_f$$
+* $\alpha = 0.90$: Smoothing coefficient prioritizing responsive updates while filtering out mechanical noise.
+* $W$: Mean of 3 consecutive raw measurements.
+* $W'_f$: Filtered weight output from previous cycle.
+
+### 3. Deadband Zero-Clamping
+$$|W_f| < 4\text{ g} \implies W_{\text{output}} = 0\text{ g}$$
+Suppresses baseline mechanical jitter and small temperature drift when the basket is empty.
+
+### 4. Cumulative Expected Weight
+$$W_{\text{expected}} = \sum_{i=1}^{n} w_i + w_{\text{new}}$$
+The catalogue weight of all validated items currently in the shopping session plus the newly scanned item.
+
+### 5. Dual Verification Tolerance Test
+$$|W_{\text{measured}} - W_{\text{expected}}| \le \text{tolerance}$$
+* $\text{tolerance}$: Defined per product in catalogue (standard: $\pm 15\text{ g}$, eggs: $\pm 20\text{ g}$).
+* If condition is satisfied: Item is confirmed as **Weight OK**.
+* If discrepancy detected: Item is flagged as **Weight Mismatch**, triggering the ESP32 buzzer signal and web dashboard alert.
+
+### 6. Billing Formula with Tax
+$$\text{Final Total} = 1.05 \times \sum_{i=1}^{n} (q_i \times p_i) - D$$
+Calculates subtotal of quantity $\times$ unit price, applies standard 5% GST, and subtracts any promotional discounts ($D$).
+
+---
+
+## 🔌 Hardware Setup & Pin Mapping
+
+| Component | Module Pin | ESP32 Pin | Function / Protocol | Voltage |
+|---|---|---|---|---|
+| **RC522 RFID Reader** | SDA / SS | GPIO 5 | SPI Slave Select | 3.3 V |
+| | SCK | GPIO 18 | SPI Clock | 3.3 V |
+| | MOSI | GPIO 23 | Master Out Slave In | 3.3 V |
+| | MISO | GPIO 19 | Master In Slave Out | 3.3 V |
+| | RST | GPIO 27 | Hardware Reset | 3.3 V |
+| | GND & 3.3V | GND & 3V3 | Power Supply | 3.3 V |
+| **HX711 24-Bit ADC** | DT (Data) | GPIO 32 | Serial Data Output | 3.3 V |
+| | SCK (Clock) | GPIO 33 | Serial Clock Input | 3.3 V |
+| | VCC & GND | 3V3 & GND | Power Supply | 3.3 V |
+| | E+, E-, A+, A- | Load Cell | 4-Wire Wheatstone Bridge | Excitation |
+| **16×2 LCD Display** | SDA | GPIO 21 | I2C Data Line | 5 V (VIN) |
+| | SCL | GPIO 22 | I2C Clock Line | 5 V (VIN) |
+| | VCC & GND | VIN & GND | I2C Backpack Power | 5 V |
+
+> **Wiring Note**: Ensure a common ground connection across ESP32, RC522, HX711, and the LCD backpack. RC522 and HX711 logic must be powered from the 3.3V rail.
+
+---
+
+## 📦 Seeded Product Catalogue
+
+The system comes pre-configured with everyday supermarket items ready for testing:
+
+| Product Name | RFID Tag UID | Price (₹) | Expected Weight (g) | Weight Tolerance (g) |
+|---|---|---|---|---|
+| **Amul Milk 500ml** | `E2MILK001` | ₹28.00 | 520 g | $\pm 15\text{ g}$ |
+| **Whole Wheat Bread** | `E2BREAD01` | ₹45.00 | 400 g | $\pm 15\text{ g}$ |
+| **Basmati Rice 1kg** | `E2RICE001` | ₹120.00 | 1000 g | $\pm 15\text{ g}$ |
+| **Farm Fresh Eggs (6-pack)**| `E2EGGS001` | ₹72.00 | 360 g | $\pm 20\text{ g}$ |
+| **Sunflower Cooking Oil 1L** | `E2OIL0001` | ₹160.00 | 920 g | $\pm 15\text{ g}$ |
+
+---
+
+## 🛠️ Installation & Setup Instructions
+
+### Prerequisites
+* **Node.js**: v18.0.0 or later installed
+* **PostgreSQL**: Local Postgres instance or [Neon Cloud PostgreSQL](https://neon.tech)
+* **Arduino IDE** (if uploading to physical ESP32): ESP32 board support package installed
+
+---
+
+### Step 1: Clone Repository & Install Dependencies
 ```bash
+git clone https://github.com/Yagami-light45/RFID-and-Weight-Sensor-Based-Smart-Billing.git
+cd RFID-and-Weight-Sensor-Based-Smart-Billing
 npm install
-cp .env.example .env
-npx prisma migrate deploy
+```
+
+---
+
+### Step 2: Configure Environment Variables
+Create a `.env` file in the project root:
+```env
+# For local PostgreSQL:
+DATABASE_URL="postgresql://username:password@localhost:5432/smart_trolley"
+
+# For Neon Serverless Cloud PostgreSQL:
+# DATABASE_URL="postgresql://user:pass@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require"
+```
+
+---
+
+### Step 3: Database Migration & Seeding
+Initialize the database schema and populate the product catalogue:
+```bash
+# Push database migrations
+npx prisma migrate dev --name init
+
+# Seed database with sample products and trolleys (CART_01, CART_02, CART_03)
 npm run db:seed
+```
+
+---
+
+### Step 4: Run the Web Application
+```bash
+# Start Next.js development server
 npm run dev
 ```
+Open your browser and navigate to:
+* **Store Home & Trolley Selector**: [http://localhost:3000](http://localhost:3000)
+* **Trolley 01 Dashboard**: [http://localhost:3000/CART_01](http://localhost:3000/CART_01)
+* **Cashier & Store Admin Portal**: [http://localhost:3000/admin](http://localhost:3000/admin)
 
-Open [http://localhost:3000](http://localhost:3000).
-
-`.env` holds one setting:
-
-```
-DATABASE_URL="postgresql://trolley:trolley@localhost:5432/smart_trolley"
-```
-
-If that database is already migrated and seeded, `npm run dev` is enough.
-
-To run the production build instead:
-
+To run a production build:
 ```bash
 npm run build
 npm start
 ```
 
-## Pages
+---
 
-### Home
+### Step 5: Flash ESP32 Firmware (`esp32.ino`)
+1. Open `esp32.ino` in the Arduino IDE.
+2. Install required Arduino libraries via Library Manager:
+   * `MFRC522` by GithubCommunity
+   * `HX711` by Bogdan Necula
+   * `LiquidCrystal_I2C` by Frank de Brabander
+3. Configure your network credentials and server IP in `esp32.ino`:
+   ```cpp
+   static const char* WIFI_SSID     = "Your_WiFi_SSID";
+   static const char* WIFI_PASSWORD = "Your_WiFi_Password";
+   static const char* SERVER_IP     = "192.168.1.100"; // Local IP of computer running Next.js
+   static const uint16_t SERVER_PORT = 3000;
+   static const char* CART_ID       = "CART_01";
+   ```
+4. Select board **ESP32 Dev Module**, choose the correct COM port, and click **Upload**.
 
-[http://localhost:3000](http://localhost:3000) lists every trolley with a QR code and the direct link. Print or open that link on a phone; it is the page attached to the physical trolley.
+---
 
-The same page lists the products the scanner knows, including each RFID tag, price, expected weight, and tolerance.
+## ⚖️ Load Cell Calibration Procedure
 
-### Trolley dashboard
+1. **Empty Basket Power-On**: Power on the ESP32 with the weighing basket completely empty. Allow a 10-second warmup period for the strain gauge bridge to thermally stabilize.
+2. **Auto-Tare**: The firmware automatically averages 50 readings to establish baseline zero tare offset ($R_0$).
+3. **Reference Mass Loading**: Place a known calibration mass (e.g. $m = 230\text{ g}$) in the basket.
+4. **Determine Scale Factor**:
+   $$k = \frac{R - R_0}{m}$$
+   * Example: $(14,510\text{ counts}) / (230\text{ g}) = 63.09\text{ counts/gram}$.
+5. **Verification**: Place secondary test weights. If readings are within $\pm 2\text{ g}$, the scale is calibrated.
 
-Open a cart directly:
+---
 
-- [http://localhost:3000/cart/CART_01](http://localhost:3000/cart/CART_01)
-- [http://localhost:3000/cart/CART_02](http://localhost:3000/cart/CART_02)
-- [http://localhost:3000/cart/CART_03](http://localhost:3000/cart/CART_03)
+## 🧪 Testing & Simulation (Without Hardware)
 
-The header shows:
+You can fully test the complete hardware workflow, scan logic, and cashier approvals using the built-in simulator scripts or `curl`.
 
-- the cart id
-- **Online** or **Offline**, based on the live connection
-- **Normal** (green) or **Weight discrepancy** (red)
-
-Three cards show the running bill in rupees, the item count, and expected weight against the scale. The dark mark on the bar is the expected weight. The bar itself is the measured weight.
-
-The list under the cards is the bill: name, unit price, quantity, weight, subtotal, and **Remove**. Remove takes one unit off that line and checks the weight again. If the item is still on the scale, the cart turns red.
-
-**Checkout** opens a verification window.
-
-- When the scale matches, choose **Pay with UPI** or **Pay with card**. Payment is simulated. A reference such as `PAY-CART_01-…` appears on the page, and the cart becomes checked out. Further scans are rejected until you start a new session.
-- When the scale does not match, payment stays closed. **Flag for cashier** keeps the bill and marks the cart for audit.
-
-**New session** clears the items, the bill, and the weight flag so the trolley can be used again. Older scan logs stay in the database.
-
-Leave this page open while you run scans. It updates without a refresh.
-
-### Admin
-
-[http://localhost:3000/admin](http://localhost:3000/admin) is the store view.
-
-- **Checked-out revenue** is the sum of carts that are still checked out. Starting a new session on a cart removes that cart's total from this number.
-- **Active sessions** counts carts that are still shopping, including flagged ones.
-- **Weight alerts** counts carts with a weight mismatch.
-
-Each card links to that trolley's dashboard. A flagged cart has a red border. This page is live as well.
-
-## Products already in the database
-
-| Tag | Product | Price | Expected weight | Tolerance |
-| --- | --- | --- | --- | --- |
-| `E2MILK001` | Amul Milk 500ml | ₹28 | 520 g | ±15 g |
-| `E2BREAD01` | Whole Wheat Bread | ₹45 | 400 g | ±15 g |
-| `E2RICE001` | Basmati Rice 1kg | ₹120 | 1000 g | ±15 g |
-| `E2EGGS001` | Eggs 6 pack | ₹72 | 360 g | ±20 g |
-| `E2OIL0001` | Sunflower Oil 1L | ₹160 | 920 g | ±15 g |
-
-`measuredWeight` is the **whole cart** on the scale, in grams, not the weight of the single new item.
-
-A scan is accepted when the scale is within the scanned product's tolerance of the cart's expected weight plus that product. A difference of exactly 15 g on milk is accepted. 16 g is rejected. Eggs allow 20 g. On a rejection the buzzer flag is returned, the product is not added, and the dashboard turns red.
-
-At checkout the allowed difference is the largest tolerance among items already in the cart.
-
-## Use it without the ESP32
-
-Keep `npm run dev` running, and keep a trolley page open in the browser.
-
-### Run the full hardware story
-
+### Option A: Run Full Automated Simulation
 ```bash
 npm run simulate
 ```
+This automated simulation:
+1. Resets active sessions on `CART_01`, `CART_02`, and `CART_03`.
+2. Simulates placing Milk and Bread into `CART_01` at matching weights.
+3. Tests weight mismatch rejection and alert buzzer triggering.
+4. Tests unknown tag rejection with HTTP 404 handling.
+5. Verifies item removal and final invoice generation.
+6. Simulates cashier counter confirmation.
 
-The script resets the three carts, then:
+### Option B: Manual API Scans via `curl`
 
-1. Scans milk and bread into `CART_01` at the correct combined weight.
-2. Scans rice with a weight that is too low, so the item is refused and the cart is flagged.
-3. Sends an unknown tag and gets `404`.
-4. Presses remove-last while the scale still includes the removed item, so the cart stays flagged.
-5. Scans the remaining items at the correct weight, verifies, and pays by card.
-6. Shows that another scan on a checked-out cart is rejected.
-7. Checks the ±15 g boundary on `CART_02`, then flags that cart at checkout because the scale does not match.
-8. Adds two milks to `CART_03`, removes one from the dashboard API, then removes the last item.
+* **1. Scan Milk (520 g) into Cart 01**:
+  ```bash
+  curl -X POST http://localhost:3000/api/cart/CART_01/scan \
+    -H "Content-Type: application/json" \
+    -d '{"rfidUid":"E2MILK001","measuredWeight":520}'
+  ```
+  *Response*:
+  ```json
+  { "status": "SUCCESS", "product": "Amul Milk 500ml", "total": 28.00 }
+  ```
 
-Point it at another server with:
+* **2. Scan Bread (400 g) — Cumulative Weight Now 920 g**:
+  ```bash
+  curl -X POST http://localhost:3000/api/cart/CART_01/scan \
+    -H "Content-Type: application/json" \
+    -d '{"rfidUid":"E2BREAD01","measuredWeight":920}'
+  ```
 
-```bash
-BASE_URL=http://localhost:3000 npm run simulate
-```
+* **3. Simulate Weight Mismatch**:
+  ```bash
+  curl -X POST http://localhost:3000/api/cart/CART_01/scan \
+    -H "Content-Type: application/json" \
+    -d '{"rfidUid":"E2RICE001","measuredWeight":1000}'
+  ```
+  *Response*:
+  ```json
+  { "status": "MISMATCH", "alertBuzzer": true, "message": "Weight mismatch detected" }
+  ```
 
-### Send one scan yourself
+* **4. Generate Final Bill**:
+  ```bash
+  curl -X POST http://localhost:3000/api/cart/CART_01/bill \
+    -H "Content-Type: application/json" \
+    -d '{"measuredWeight":920}'
+  ```
 
-Put milk in an empty `CART_01`. The scale should read about 520 g.
+* **5. Cashier Physical Counter Confirmation**:
+  ```bash
+  curl -X POST http://localhost:3000/api/admin/bills/CART_01/confirm \
+    -H "Content-Type: application/json" \
+    -d '{"paymentMethod":"UPI","reference":"UPI_REF_987654321"}'
+  ```
 
-```bash
-curl -s -X POST http://localhost:3000/api/cart/CART_01/scan \
-  -H 'Content-Type: application/json' \
-  -d '{"rfidTag":"E2MILK001","measuredWeight":520}'
-```
+---
 
-A matching scan responds with:
+## 🌐 API Reference Summary
 
-```json
-{ "status": "SUCCESS", "product": "Amul Milk 500ml", "total": 28 }
-```
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/cart/:cartId/scan` | Hardware scan input; validates weight tolerance and updates cart |
+| `POST` | `/api/cart/:cartId/remove-last` | Removes previous item and verifies weight reduction |
+| `DELETE` | `/api/cart/:cartId/items/:itemId` | Deletes a specific line item via web interface |
+| `POST` | `/api/cart/:cartId/bill` | Verifies final cart weight, calculates 5% GST, and creates bill |
+| `POST` | `/api/cart/:cartId/reset` | Resets trolley session for the next shopper |
+| `GET` | `/api/cart/:cartId` | Fetches active trolley state, items, and billing totals |
+| `GET` | `/api/cart/:cartId/events` | Server-Sent Events stream for live mobile cart synchronization |
+| `GET` | `/api/admin/overview` | Retrieves store statistics, fleet status, and sales history |
+| `GET` | `/api/admin/events` | Server-Sent Events stream for live cashier monitoring board |
+| `POST` | `/api/admin/bills/:cartId/confirm` | Cashier settlement confirming Cash, Card, or UPI payment |
 
-Add bread. The scale should now read about 920 g (520 + 400):
+---
 
-```bash
-curl -s -X POST http://localhost:3000/api/cart/CART_01/scan \
-  -H 'Content-Type: application/json' \
-  -d '{"rfidTag":"E2BREAD01","measuredWeight":920}'
-```
+## 🌟 Future Opportunities & Roadmap
 
-Scan rice but leave the scale at 1000 g. The expected weight would be 1920 g, so this is a mismatch. Rice is not added, and the response tells the ESP32 to buzz:
+* **Continuous Multi-Point Calibration**: Dynamic multi-point calibration tables with active temperature compensation for industrial cold-chain environments.
+* **Smart Autonomous Removal Detection**: Machine learning weight profile analysis to automatically detect and identify un-scanned item removals.
+* **On-Trolley Rechargeable Battery Station**: Integrated Li-ion power pack with inductive charging dock stations at trolley return bays.
+* **Barcode & Computer Vision Hybrid Support**: Secondary overhead mini-camera verification for high-density mixed retail baskets.
+* **Enterprise Multi-Store Fleet Management**: Centralized cloud orchestration supporting multi-store retail chains with distributed cashier terminals.
 
-```bash
-curl -s -X POST http://localhost:3000/api/cart/CART_01/scan \
-  -H 'Content-Type: application/json' \
-  -d '{"rfidTag":"E2RICE001","measuredWeight":1000}'
-```
-
-```json
-{ "status": "MISMATCH", "alertBuzzer": true }
-```
-
-An unknown tag returns HTTP 404:
-
-```bash
-curl -s -X POST http://localhost:3000/api/cart/CART_01/scan \
-  -H 'Content-Type: application/json' \
-  -d '{"rfidTag":"E2NOTREAL","measuredWeight":920}'
-```
-
-Remove the last successfully scanned item. Send the scale reading after the item is lifted. If bread was last and only milk remains, that reading is 520:
-
-```bash
-curl -s -X POST http://localhost:3000/api/cart/CART_01/remove-last \
-  -H 'Content-Type: application/json' \
-  -d '{"measuredWeight":520}'
-```
-
-If you send the old weight and the item is still in the basket, the removal still happens and the response is `MISMATCH` with `alertBuzzer: true`.
-
-Checkout has two steps. First confirm the weight:
-
-```bash
-curl -s -X POST http://localhost:3000/api/cart/CART_01/checkout \
-  -H 'Content-Type: application/json' \
-  -d '{"measuredWeight":520}'
-```
-
-When that returns `"status": "VERIFIED"`, pay:
-
-```bash
-curl -s -X POST http://localhost:3000/api/cart/CART_01/checkout \
-  -H 'Content-Type: application/json' \
-  -d '{"measuredWeight":520,"paymentMethod":"UPI"}'
-```
-
-`paymentMethod` is `UPI` or `CARD`. A weight that does not match returns `"status": "FLAGGED"` and does not take payment.
-
-Clear a trolley and start again:
-
-```bash
-curl -s -X POST http://localhost:3000/api/cart/CART_01/reset
-```
-
-A new cart id is created the first time it is scanned or opened. For example, `POST /api/cart/CART_04/scan` creates `CART_04` and it shows up on the admin page.
-
-## What the ESP32 should send
-
-| Action | Request |
-| --- | --- |
-| Tag read | `POST /api/cart/CART_01/scan` with `{ "rfidTag", "measuredWeight" }` |
-| Remove button | `POST /api/cart/CART_01/remove-last` with `{ "measuredWeight" }` |
-| Final weight check | `POST /api/cart/CART_01/checkout` with `{ "measuredWeight" }` |
-| Demo payment | same checkout path, adding `"paymentMethod": "UPI"` or `"CARD"` |
-
-Buzz the buzzer when the JSON body has `"alertBuzzer": true`. On a successful scan, show `product` and `total` on the LCD. The phone page updates on its own.
-
-## Switch the database to Neon
-
-Replace `DATABASE_URL` in `.env` with the Neon connection string. Keep `sslmode=require` on that URL. Then run:
-
-```bash
-npx prisma migrate deploy
-npm run db:seed
-```
-
-Restart `npm run dev`. The pages and the ESP32 paths stay the same.
+---
